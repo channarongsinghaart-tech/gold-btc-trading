@@ -6,7 +6,7 @@ import requests
 import streamlit as st
 import plotly.graph_objects as go
 
-st.set_page_config(page_title='Gold & BTC Trading Analyzer V4.1 A', page_icon='📈', layout='wide')
+st.set_page_config(page_title='Gold & BTC Trading Analyzer V4.1 C', page_icon='📈', layout='wide')
 
 BASE = 'https://api.twelvedata.com'
 ASSETS = {'Gold XAU/USD': 'XAU/USD', 'Bitcoin BTC/USD': 'BTC/USD'}
@@ -128,64 +128,99 @@ def levels(d, lookback=120):
     return support,resistance
 
 
-def v41a_engine(frames):
+def v41_engine(frames, mode):
     details={}
     for tf in ANALYSIS_TFS:
         d=frames.get(tf)
         if d is not None and not d.empty:
-            b,s,r=bias(d); details[tf]={'Bias':b,'Strength':s,'Structure':structure_state(d),'Reason':r}
+            b,s,r=bias(d)
+            details[tf]={'Bias':b,'Strength':s,'Structure':structure_state(d),'Reason':r}
     required=ANALYSIS_TFS
     if any(tf not in details for tf in required):
         return 'NO TRADE',0,0,details,'ข้อมูล MTF ไม่ครบ'
+
     dirs={tf:details[tf]['Bias'] for tf in required}
     d1,h4,h1,m30,m15=[dirs[x] for x in required]
-    # A = strict: D1/H4/H1 must agree; M30 cannot oppose; M15 must agree.
-    if d1 not in ('LONG','SHORT') or h4!=d1 or h1!=d1 or m15!=d1:
-        return 'NO TRADE',0,0,details,'Regime/entry timeframe ยังไม่ตรงกัน'
-    if m30 not in (d1,'NEUTRAL'):
-        return 'NO TRADE',0,0,details,'M30 สวนทางกับ trend หลัก'
-    align=100 if m30==d1 else 90
+
+    # Mode A = original strict logic.
+    if mode == 'A — Strict':
+        if d1 not in ('LONG','SHORT') or h4!=d1 or h1!=d1 or m15!=d1:
+            return 'NO TRADE',0,0,details,'A: Regime/entry timeframe ยังไม่ตรงกัน'
+        if m30 not in (d1,'NEUTRAL'):
+            return 'NO TRADE',0,0,details,'A: M30 สวนทางกับ trend หลัก'
+        align=100 if m30==d1 else 90
+        strengths=[details[t]['Strength'] for t in required if details[t]['Bias']==d1]
+        score=int(round(np.mean(strengths)))
+        if score<68:
+            return 'NO TRADE',score,align,details,'A: Strength ต่ำกว่าเกณฑ์ 68'
+        signal='STRONG LONG' if d1=='LONG' and score>=82 and align>=90 else 'STRONG SHORT' if d1=='SHORT' and score>=82 and align>=90 else d1
+        return signal,score,align,details,'A: D1/H4/H1/M15 สอดคล้อง'
+
+    # Mode B = balanced: D1/H4 establish the regime; lower TFs provide confirmation.
+    if d1 not in ('LONG','SHORT') or h4!=d1:
+        return 'NO TRADE',0,0,details,'B: D1/H4 ยังไม่กำหนด trend เดียวกัน'
+    confirmations=sum(x==d1 for x in (h1,m30,m15))
+    opposed=sum(x not in (d1,'NEUTRAL') for x in (h1,m30,m15))
     strengths=[details[t]['Strength'] for t in required if details[t]['Bias']==d1]
-    score=int(round(np.mean(strengths)))
-    if score<68:
-        return 'NO TRADE',score,align,details,'Strength ต่ำกว่าเกณฑ์ A (68)'
-    signal='STRONG LONG' if d1=='LONG' and score>=82 and align>=90 else 'STRONG SHORT' if d1=='SHORT' and score>=82 and align>=90 else d1
-    return signal,score,align,details,'ผ่าน A: D1/H4/H1/M15 สอดคล้อง'
+    score=int(round(np.mean(strengths))) if strengths else 50
+    align=int(round(40 + 20*int(h4==d1) + 13.33*confirmations))
+    align=int(np.clip(align,0,100))
+    if opposed>=2 or score<58:
+        return 'NO TRADE',score,align,details,'B: trend ยังขัดกันหรือ strength ต่ำ'
+    if m15 not in (d1,'NEUTRAL') and opposed>=1:
+        return 'NO TRADE',score,align,details,'B: M15 สวนทางและยังไม่มี confirmation พอ'
+    strong = score>=78 and confirmations>=2
+    signal=('STRONG LONG' if d1=='LONG' else 'STRONG SHORT') if strong else d1
+    return signal,score,align,details,f'B: D1/H4 เป็น {d1}; confirmation {confirmations}/3'
 
 
-def strict_entry(frames, direction, support, resistance):
+def entry_plan(frames, direction, support, resistance, mode):
     if direction=='NO TRADE': return None
-    m15=frames['15m']; h1=frames['1h']; h4=frames['4h']
+    base_direction='LONG' if 'LONG' in direction else 'SHORT'
+    m15=frames.get('15m'); h1=frames.get('1h'); h4=frames.get('4h')
+    if any(x is None or x.empty for x in (m15,h1,h4)): return None
     x=m15.iloc[-1]; atr=float(x.ATR); price=float(x.close)
     if not np.isfinite(atr) or atr<=0: return None
     flags=setup_flags(m15)
-    if direction in ('LONG','STRONG LONG'):
-        setup=flags.get('bull_pullback') or flags.get('bull_breakout') or flags.get('bull_sweep')
-        if not setup: return None
-        # Do not chase directly into resistance.
-        if np.isfinite(resistance) and resistance>price and resistance-price<0.75*atr: return None
-        invalidation=float(min(h1.tail(30).low.min(),h4.tail(20).low.min()))
-        sl=invalidation-0.25*atr; risk=price-sl
-        if risk<=0 or risk>3.0*atr: return None
-        tp1=price+1.5*risk; tp2=price+2.5*risk
-        return {'direction':'LONG','entry':price,'sl':sl,'tp1':tp1,'tp2':tp2,'risk':risk,'rr1':1.5,'rr2':2.5,'invalidation':invalidation,'setup':'Pullback/Breakout/Sweep'}
-    setup=flags.get('bear_pullback') or flags.get('bear_breakdown') or flags.get('bear_sweep')
-    if not setup: return None
-    if np.isfinite(support) and price>support and price-support<0.75*atr: return None
-    invalidation=float(max(h1.tail(30).high.max(),h4.tail(20).high.max()))
-    sl=invalidation+0.25*atr; risk=sl-price
-    if risk<=0 or risk>3.0*atr: return None
-    tp1=price-1.5*risk; tp2=price-2.5*risk
-    return {'direction':'SHORT','entry':price,'sl':sl,'tp1':tp1,'tp2':tp2,'risk':risk,'rr1':1.5,'rr2':2.5,'invalidation':invalidation,'setup':'Pullback/Breakdown/Sweep'}
 
+    if base_direction=='LONG':
+        setup = flags.get('bull_pullback') or flags.get('bull_breakout') or flags.get('bull_sweep')
+        near_ema = np.isfinite(x.EMA20) and abs(price-float(x.EMA20)) <= (0.50 if mode=='B — Balanced' else 0.20)*atr and price>float(x.EMA50)
+        if mode=='A — Strict' and not setup: return None
+        if mode=='B — Balanced' and not (setup or near_ema): return None
+        # A blocks close resistance; B only blocks extremely tight resistance.
+        resistance_buffer = 0.75 if mode=='A — Strict' else 0.25
+        if np.isfinite(resistance) and resistance>price and resistance-price<resistance_buffer*atr: return None
+        invalidation=float(min(h1.tail(30).low.min(),h4.tail(20).low.min()))
+        sl=invalidation-(0.25 if mode=='A — Strict' else 0.20)*atr
+        risk=price-sl
+        max_risk=3.0 if mode=='A — Strict' else 4.0
+        if risk<=0 or risk>max_risk*atr: return None
+        tp1=price+1.5*risk; tp2=price+2.5*risk
+        return {'direction':'LONG','entry':price,'sl':sl,'tp1':tp1,'tp2':tp2,'risk':risk,'rr1':1.5,'rr2':2.5,'invalidation':invalidation,'setup':'Pullback/Breakout/Sweep' if setup else 'EMA20 proximity'}
+
+    setup = flags.get('bear_pullback') or flags.get('bear_breakdown') or flags.get('bear_sweep')
+    near_ema = np.isfinite(x.EMA20) and abs(price-float(x.EMA20)) <= (0.50 if mode=='B — Balanced' else 0.20)*atr and price<float(x.EMA50)
+    if mode=='A — Strict' and not setup: return None
+    if mode=='B — Balanced' and not (setup or near_ema): return None
+    support_buffer = 0.75 if mode=='A — Strict' else 0.25
+    if np.isfinite(support) and price>support and price-support<support_buffer*atr: return None
+    invalidation=float(max(h1.tail(30).high.max(),h4.tail(20).high.max()))
+    sl=invalidation+(0.25 if mode=='A — Strict' else 0.20)*atr
+    risk=sl-price
+    max_risk=3.0 if mode=='A — Strict' else 4.0
+    if risk<=0 or risk>max_risk*atr: return None
+    tp1=price-1.5*risk; tp2=price-2.5*risk
+    return {'direction':'SHORT','entry':price,'sl':sl,'tp1':tp1,'tp2':tp2,'risk':risk,'rr1':1.5,'rr2':2.5,'invalidation':invalidation,'setup':'Pullback/Breakdown/Sweep' if setup else 'EMA20 proximity'}
 
 def fmt(v): return f'{v:,.4f}'
 
-st.title('Gold & Bitcoin Trading Analyzer — V4.1 A')
-st.caption('โหมด A = Strict / High Selectivity. เน้นคัดกรองมากกว่า V3; สัญญาณน้อยลงได้เป็นปกติ. Confidence ไม่ใช่ win probability.')
+st.title('Gold & Bitcoin Trading Analyzer — V4.1 C')
+st.caption('V4.1 C = เลือกโหมด A Strict หรือ B Balanced ได้จาก Sidebar. Confidence ไม่ใช่ win probability.')
 
 with st.sidebar:
     st.header('ตั้งค่าการวิเคราะห์')
+    mode=st.radio('โหมดสัญญาณ', ['A — Strict','B — Balanced'], index=0, help='A คัดเข้มและสัญญาณน้อยกว่า; B ผ่อน Entry Filter เพื่อให้มีจังหวะมากขึ้น')
     asset=st.selectbox('สินทรัพย์',list(ASSETS.keys()))
     timeframe=st.selectbox('Timeframe หลัก',list(TF.keys()),index=1)
     outputsize=st.select_slider('จำนวนแท่ง',options=[300,500,800],value=500)
@@ -212,13 +247,13 @@ for tf in ANALYSIS_TFS:
     if not er and len(x)>=220: frames[tf]=add_indicators(x)
     else: errors[tf]=er or 'ข้อมูลไม่พอ'
 
-vsignal,vscore,alignment,details,gate_reason=v41a_engine(frames)
-risk=strict_entry(frames,vsignal,support,resistance) if vsignal!='NO TRADE' else None
+vsignal,vscore,alignment,details,gate_reason=v41_engine(frames,mode)
+risk=entry_plan(frames,vsignal,support,resistance,mode) if vsignal!='NO TRADE' else None
 confidence=int(np.clip(0.65*vscore+0.35*alignment,50,99)) if vsignal!='NO TRADE' else 0
 
 c1,c2,c3,c4,c5=st.columns(5)
 c1.metric('Price',fmt(price),f'{pct:+.2f}%')
-c2.metric('V4.1 A Signal',vsignal)
+c2.metric('V4.1 C Signal',vsignal)
 c3.metric('Score',f'{vscore}/100')
 c4.metric('Confidence',f'{confidence}%' if confidence else '—')
 c5.metric('RSI',f'{last.RSI:.1f}')
@@ -231,7 +266,7 @@ fig.update_layout(height=620,xaxis_rangeslider_visible=False,margin=dict(l=10,r=
 
 left,right=st.columns(2)
 with left:
-    st.subheader('V4.1 A Gate')
+    st.subheader(f'V4.1 C Gate — {mode}')
     st.write(f'**{gate_reason}**')
     st.write(f'Alignment: **{alignment}%**')
     st.write(f'Support: **{fmt(support)}**')
@@ -245,8 +280,8 @@ with right:
         st.write(f"TP1: **{fmt(risk['tp1'])}** (R:R 1:{risk['rr1']:.1f})")
         st.write(f"TP2: **{fmt(risk['tp2'])}** (R:R 1:{risk['rr2']:.1f})")
         st.caption(f"Risk/Unit: {fmt(risk['risk'])} • Invalidation: {fmt(risk['invalidation'])}")
-    elif vsignal!='NO TRADE': st.warning('Trend ผ่าน แต่ Entry Filter A ยังไม่ผ่าน — รอจังหวะ')
-    else: st.write('NO TRADE — ไม่ผ่าน Strict Gate')
+    elif vsignal!='NO TRADE': st.warning(f'Trend ผ่าน แต่ Entry Filter {mode[0]} ยังไม่ผ่าน — รอจังหวะ')
+    else: st.write('NO TRADE — ไม่ผ่าน Gate ของโหมดที่เลือก')
 
 st.subheader('Top-Down Multi-Timeframe')
 rows=[]
@@ -269,4 +304,4 @@ st.dataframe(pd.DataFrame([
     ['RSI14',float(last.RSI)],['MACD',float(last.MACD)],['MACD Signal',float(last.MACDsig)],['ATR14',float(last.ATR)]
 ],columns=['Indicator','Value']),hide_index=True,use_container_width=True)
 
-st.caption('V4.1 A เป็นระบบวิเคราะห์ ไม่ส่งคำสั่งซื้อขายอัตโนมัติ. Strict mode อาจแสดง NO TRADE เป็นส่วนใหญ่เมื่อ regime ไม่ชัดหรือ entry อยู่ใกล้แนวรับ/แนวต้าน. ความสดของข้อมูลขึ้นกับแพ็กเกจ Twelve Data และ API credits.')
+st.caption('V4.1 C เป็นระบบวิเคราะห์ ไม่ส่งคำสั่งซื้อขายอัตโนมัติ. A = Strict/คัดเข้ม; B = Balanced/มีจังหวะมากขึ้น. ความสดของข้อมูลขึ้นกับแพ็กเกจ Twelve Data และ API credits.')
