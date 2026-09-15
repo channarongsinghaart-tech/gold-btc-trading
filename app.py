@@ -302,11 +302,12 @@ def entry_plan(frames, direction, support, resistance, mode, flow, loc, vp):
 def fmt(v): return f'{v:,.4f}'
 
 st.title('Gold & Bitcoin Trading Analyzer — V4.2')
-st.caption('V4.2 = top-down regime + location/value + fib + participation + candle/volume order-flow proxy. Proxy ≠ true footprint/delta/DOM.')
+st.caption('V4.2 M30-Primary = D1 → H4 → H1 → M30 setup → M5 confirmation. Order-flow is a proxy, not true footprint/delta/DOM.')
 
 with st.sidebar:
     st.header('ตั้งค่าการวิเคราะห์')
     mode=st.radio('โหมดสัญญาณ',['A — Strict','B — Balanced'],index=0,help='A คัดเข้ม; B เปิดโอกาสมากขึ้น')
+    st.info('โครงสร้าง V4.2: D1 → H4 → H1 → M30 (หลัก) → M5 (ยืนยัน)')
     asset=st.selectbox('สินทรัพย์',list(ASSETS.keys()),index=0)
     timeframe=st.selectbox('Timeframe หลัก',list(TF.keys()),index=2)
     outputsize=st.select_slider('จำนวนแท่ง',options=[300,500,800],value=500)
