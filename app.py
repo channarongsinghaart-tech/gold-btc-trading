@@ -6,7 +6,7 @@ import requests
 import streamlit as st
 import plotly.graph_objects as go
 
-st.set_page_config(page_title='Gold & BTC Trading Analyzer V4.2.1', page_icon='📈', layout='wide')
+st.set_page_config(page_title='Gold & BTC Trading Analyzer V4.2.2', page_icon='📈', layout='wide')
 
 BASE = 'https://api.twelvedata.com'
 ASSETS = {'Gold XAU/USD': 'XAU/USD', 'Bitcoin BTC/USD': 'BTC/USD'}
@@ -365,11 +365,18 @@ def regime_compatible(mode, frames, base):
         return e4 in ('INITIATIVE UP','BALANCE','COMPRESSION') and e1 in ('INITIATIVE UP','BALANCE','COMPRESSION')
     return e4 in ('INITIATIVE DOWN','BALANCE','COMPRESSION') and e1 in ('INITIATIVE DOWN','BALANCE','COMPRESSION')
 
-def entry_quality(frames, direction, mode, flow, loc, vp, risk, vscore, alignment):
-    """Separate setup quality from trend score. Returns 0-100 plus component breakdown."""
-    if direction == 'NO TRADE' or risk is None:
-        return 0, {'Trend': int(vscore), 'Alignment': int(alignment), 'Setup': 0, 'Confirmation': int(abs(flow.get('score',50)-50)*2), 'Location': 0, 'R:R': 0, 'Regime': 0}
-    base='LONG' if 'LONG' in direction else 'SHORT'
+def entry_quality(frames, direction, mode, flow, loc, vp, risk, vscore, alignment, details=None):
+    """Separate setup quality from trend score. Returns 0-100 plus component breakdown.
+    When there is NO TRADE, estimate readiness from the dominant higher-timeframe
+    direction so the UI still shows why the setup is not ready.
+    """
+    details = details or {}
+    if direction == 'NO TRADE':
+        base = 'LONG' if details.get('1D',{}).get('Bias') == 'LONG' or (details.get('1D',{}).get('Bias') == 'NEUTRAL' and details.get('4h',{}).get('Bias') == 'LONG') else 'SHORT'
+        if details.get('1D',{}).get('Bias') == 'SHORT' or (details.get('1D',{}).get('Bias') == 'NEUTRAL' and details.get('4h',{}).get('Bias') == 'SHORT'):
+            base='SHORT'
+    else:
+        base='LONG' if 'LONG' in direction else 'SHORT'
     m30=frames.get('30m')
     if m30 is None or m30.empty:
         return 0, {}
@@ -388,7 +395,12 @@ def entry_quality(frames, direction, mode, flow, loc, vp, risk, vscore, alignmen
         confirm=int(np.clip(100-abs(fs-(82 if base=='LONG' else 18))*2.2,0,100))
     loc_text=(risk.get('location') or '')
     location=100 if (('discount' in loc_text.lower() or 'inside value' in loc_text.lower()) if base=='LONG' else ('premium' in loc_text.lower() or 'inside value' in loc_text.lower())) else 55
-    rr=min(float(risk.get('rr2',0))/3.0*100,100)
+    if risk:
+        rr=min(float(risk.get('rr2',0))/3.0*100,100)
+    else:
+        # Provisional R:R readiness: use the configured horizon's typical target multiple.
+        rr_target = 2.0 if mode=='1 — Short Hold' else 3.0
+        rr=min(rr_target/3.0*100,100)
     score=int(np.clip(round(.25*vscore+.15*alignment+.20*setup_score+.15*confirm+.10*location+.15*rr),0,100))
     return score, {'Trend':int(vscore),'Alignment':int(alignment),'Setup':int(setup_score),'Confirmation':int(confirm),'Location':int(location),'R:R':int(round(rr))}
 
@@ -400,71 +412,89 @@ def init_journal():
         st.session_state.active_trade_ids={}
 
 
-def _signal_id(symbol, mode, risk):
-    # One active setup per symbol + mode + direction. This prevents every rerun from creating duplicates.
-    return f"{symbol}|{mode}|{risk['direction']}"
+def _signal_id(symbol, mode, risk, signal_bar):
+    # Signal identity includes the completed M30 signal bar so a new setup is not
+    # confused with an older setup in the same direction.
+    ts=pd.Timestamp(signal_bar).strftime('%Y%m%d%H%M')
+    return f"{symbol}|{mode}|{risk['direction']}|{ts}"
 
 
-def _evaluate_trade(trade, current_bar):
-    if trade.get('Status') not in ('OPEN','TP1 HIT') or current_bar is None or len(current_bar)==0:
+def _evaluate_trade_on_bars(trade, m30_bars):
+    """Evaluate only bars strictly AFTER the signal bar.
+    This prevents look-ahead from using the signal candle's pre-entry range."""
+    if trade.get('Status') not in ('OPEN','TP1 HIT') or m30_bars is None or m30_bars.empty:
         return
-    hi=float(current_bar.high.iloc[-1]); lo=float(current_bar.low.iloc[-1])
-    direction=trade['Direction']
-    if direction=='LONG':
-        hit_sl=lo<=trade['SL']; hit_tp2=hi>=trade['TP2']; hit_tp1=hi>=trade['TP1']
-    else:
-        hit_sl=hi>=trade['SL']; hit_tp2=lo<=trade['TP2']; hit_tp1=lo<=trade['TP1']
+    signal_bar=pd.Timestamp(trade['Signal Bar'])
+    future=m30_bars[m30_bars.index > signal_bar]
+    if future.empty:
+        return
 
-    # Conservative same-bar rule: if SL and TP2 are both touched in one bar, require manual review.
-    if hit_sl and hit_tp2:
-        trade['Status']='BOTH TOUCHED — REVIEW'
-        trade['Result R']=np.nan
-        trade['Exit Price']=np.nan
-        return
-    if hit_tp2:
-        trade['Status']='TP2 HIT'
-        trade['Result R']=trade['RR2']
-        trade['Exit Price']=trade['TP2']
-        return
-    if hit_tp1 and trade.get('Status')=='OPEN':
-        # TP1 is treated as a partial milestone, not a closed trade.
-        trade['Status']='TP1 HIT'
-        trade['Result R']=np.nan
-        trade['Exit Price']=trade['TP1']
-        return
-    if hit_sl:
-        if trade.get('Status')=='TP1 HIT':
-            # Assumes 50% was taken at TP1 and the remaining 50% stopped.
-            trade['Status']='TP1 + SL'
-            trade['Result R']=0.5*trade['RR1']-0.5
+    for ts,row in future.iterrows():
+        hi=float(row.high); lo=float(row.low)
+        direction=trade['Direction']
+        if direction=='LONG':
+            hit_sl=lo<=trade['SL']; hit_tp1=hi>=trade['TP1']; hit_tp2=hi>=trade['TP2']
         else:
-            trade['Status']='SL HIT'
-            trade['Result R']=-1.0
-        trade['Exit Price']=trade['SL']
+            hit_sl=hi>=trade['SL']; hit_tp1=lo<=trade['TP1']; hit_tp2=lo<=trade['TP2']
+
+        # Without intrabar sequencing we cannot know which was hit first.
+        # Review whenever SL and either target are both touched in the same bar.
+        if hit_sl and (hit_tp1 or hit_tp2):
+            trade['Status']='BOTH TOUCHED — REVIEW'
+            trade['Result R']=np.nan
+            trade['Exit Price']=np.nan
+            trade['Resolved Bar']=pd.Timestamp(ts).strftime('%Y-%m-%d %H:%M UTC')
+            return
+        if hit_tp2:
+            trade['Status']='TP2 HIT'
+            trade['Result R']=trade['RR2']
+            trade['Exit Price']=trade['TP2']
+            trade['Resolved Bar']=pd.Timestamp(ts).strftime('%Y-%m-%d %H:%M UTC')
+            return
+        if hit_tp1 and trade.get('Status')=='OPEN':
+            trade['Status']='TP1 HIT'
+            trade['Result R']=np.nan
+            trade['Exit Price']=trade['TP1']
+            trade['TP1 Bar']=pd.Timestamp(ts).strftime('%Y-%m-%d %H:%M UTC')
+            # Continue checking later bars for TP2/SL.
+            continue
+        if hit_sl:
+            if trade.get('Status')=='TP1 HIT':
+                trade['Status']='TP1 + SL'
+                trade['Result R']=0.5*trade['RR1']-0.5
+            else:
+                trade['Status']='SL HIT'
+                trade['Result R']=-1.0
+            trade['Exit Price']=trade['SL']
+            trade['Resolved Bar']=pd.Timestamp(ts).strftime('%Y-%m-%d %H:%M UTC')
+            return
 
 
-def update_journal(symbol, mode, direction, risk, signal_time, current_price, current_bar):
+def update_journal(symbol, mode, direction, risk, signal_bar, m30_bars):
     init_journal()
-    # First, advance every currently active trade using the newest M30 bar.
+
+    # Always advance existing trades, even when the current setup is NO TRADE.
     for trade in st.session_state.trade_journal:
-        _evaluate_trade(trade,current_bar)
+        _evaluate_trade_on_bars(trade,m30_bars)
 
     if not risk or direction=='NO TRADE':
         return
 
-    sid=_signal_id(symbol,mode,risk)
+    sid=_signal_id(symbol,mode,risk,signal_bar)
     existing=next((x for x in st.session_state.trade_journal if x['Signal ID']==sid),None)
-    if existing is None or existing.get('Status') in ('TP2 HIT','SL HIT','TP1 + SL','BOTH TOUCHED — REVIEW'):
-        # A fresh signal is allowed only after the prior one is resolved/reviewed.
+    if existing is None:
         trade={
-            'Signal ID':sid,'Time':signal_time.strftime('%Y-%m-%d %H:%M UTC'),'Symbol':symbol,
-            'Mode':mode.split(' — ')[1] if ' — ' in mode else mode,'Direction':risk['direction'],
+            'Signal ID':sid,
+            'Signal Bar':pd.Timestamp(signal_bar).strftime('%Y-%m-%d %H:%M UTC'),
+            'Time':pd.Timestamp(signal_bar).strftime('%Y-%m-%d %H:%M UTC'),
+            'Symbol':symbol,
+            'Mode':mode.split(' — ')[1] if ' — ' in mode else mode,
+            'Direction':risk['direction'],
             'Entry':risk['entry'],'SL':risk['sl'],'TP1':risk['tp1'],'TP2':risk['tp2'],
             'Risk':risk['risk'],'RR1':risk['rr1'],'RR2':risk['rr2'],'Status':'OPEN',
-            'Result R':np.nan,'Exit Price':np.nan
+            'Result R':np.nan,'Exit Price':np.nan,'TP1 Bar':'','Resolved Bar':''
         }
         st.session_state.trade_journal.append(trade)
-
 
 def journal_stats():
     init_journal()
@@ -486,8 +516,8 @@ def journal_stats():
 
 def fmt(v): return f'{v:,.4f}'
 
-st.title('Gold & Bitcoin Trading Analyzer — V4.2.1')
-st.caption('V4.2.1 = M30-primary + 2 horizons + Entry Quality + NO TRADE reason + signal cooldown + session journal. M5 is a proxy confirmation, not true footprint/delta/DOM.')
+st.title('Gold & Bitcoin Trading Analyzer — V4.2.2')
+st.caption('V4.2.2 = M30-primary + 2 horizons + Setup Readiness + look-ahead-safe journal. M5 is a proxy confirmation, not true footprint/delta/DOM.')
 
 with st.sidebar:
     st.header('ตั้งค่าการวิเคราะห์')
@@ -509,18 +539,32 @@ if auto:
 main_df,err=get_ohlcv(symbol,TF[timeframe],outputsize)
 if err: st.error(err); st.stop()
 if len(main_df)<220: st.warning('ข้อมูลน้อยกว่า 220 แท่ง — EMA200/MTF อาจยังไม่นิ่ง')
-d=add_indicators(main_df); last=d.iloc[-1]; price=float(last.close); prev=float(d.close.iloc[-2]); pct=(price/prev-1)*100
+
+# Use only completed candles for analysis and signal generation. The newest API bar can still be forming.
+main_full=add_indicators(main_df)
+d=main_full.iloc[:-1].copy() if len(main_full)>1 else main_full.copy()
+last_live=main_full.iloc[-1]
+last=d.iloc[-1]
+price=float(last_live.close); prev=float(main_full.close.iloc[-2]) if len(main_full)>=2 else price
+pct=(price/prev-1)*100 if prev else 0.0
 support,resistance=levels(d)
 
 frames={}; errors={}
 for tf in ANALYSIS_TFS:
     x,er=get_ohlcv(symbol,TF[tf],outputsize)
-    if not er and len(x)>=220: frames[tf]=add_indicators(x)
+    if not er and len(x)>=220:
+        xx=add_indicators(x)
+        frames[tf]=xx.iloc[:-1].copy() if len(xx)>1 else xx.copy()
     else: errors[tf]=er or 'ข้อมูลไม่พอ'
 
-# 30m is the primary setup timeframe; 5m is used only as the lowest-timeframe confirmation. This is deliberately called a proxy, not true order flow.
+# 30m is the primary setup timeframe; 5m is used only as the lowest-timeframe confirmation.
+# Only completed 5m candles are used for confirmation.
 five_df,five_err=get_ohlcv(symbol,'5min',max(250,min(800,outputsize)))
-five=add_indicators(five_df) if not five_err and len(five_df)>=40 else pd.DataFrame()
+if not five_err and len(five_df)>=40:
+    five_full=add_indicators(five_df)
+    five=five_full.iloc[:-1].copy() if len(five_full)>1 else five_full.copy()
+else:
+    five=pd.DataFrame()
 flow=proxy_orderflow(five)
 loc=fib_location(five if not five.empty else d)
 vp=volume_profile_proxy(five if not five.empty else d)
@@ -528,16 +572,16 @@ vp=volume_profile_proxy(five if not five.empty else d)
 env,env_score,env_reason=environment(frames.get('4h',d))
 vsignal,vscore,alignment,details,gate_reason=v42_engine(frames,mode,flow)
 risk,entry_reason=entry_plan(frames,vsignal,support,resistance,mode,flow,loc,vp) if vsignal!='NO TRADE' else (None,'NO TRADE')
-entry_quality,quality_parts=entry_quality(frames,vsignal,mode,flow,loc,vp,risk,vscore,alignment)
+setup_readiness,quality_parts=entry_quality(frames,vsignal,mode,flow,loc,vp,risk,vscore,alignment,details)
 regime=env
 
 confidence=int(np.clip(.55*vscore+.25*alignment+.20*abs(flow['score']-50)*2,50,99)) if vsignal!='NO TRADE' else 0
 
 c1,c2,c3,c4,c5,c6=st.columns(6)
 c1.metric('Price',fmt(price),f'{pct:+.2f}%')
-c2.metric('V4.2 Signal',vsignal)
+c2.metric('V4.2.2 Signal',vsignal)
 c3.metric('Trend Score',f'{vscore}/100')
-c4.metric('Entry Quality',f'{entry_quality}/100' if risk else '—')
+c4.metric('Setup Readiness',f'{setup_readiness}/100')
 c5.metric('Confidence',f'{confidence}%' if confidence else '—')
 c6.metric('RSI',f'{last.RSI:.1f}')
 st.caption(f'แท่งล่าสุด: {last.name.strftime("%Y-%m-%d %H:%M UTC")} • {symbol} • {timeframe}')
@@ -573,15 +617,19 @@ if risk:
     st.write(f'TP1: **{fmt(risk["tp1"])}** (R:R 1:{risk["rr1"]:.1f})')
     st.write(f'TP2: **{fmt(risk["tp2"])}** (R:R 1:{risk["rr2"]:.1f})')
     st.caption(f'Risk/Unit: {fmt(risk["risk"])} • Setup: {risk["setup"]} • Flow: {risk["flow_score"]}/100')
-    st.write('Entry Quality components: ' + ' • '.join(f'{k} {v}/100' for k,v in quality_parts.items()))
-    st.caption('Entry Quality is a setup-quality score, not a win probability.')
+    st.caption(f'Signal ID: {_signal_id(symbol,mode,risk)}')
+    st.write('Setup Readiness components: ' + ' • '.join(f'{k} {v}/100' for k,v in quality_parts.items()))
+    st.caption('Setup Readiness คือความพร้อมของ setup ไม่ใช่ความน่าจะเป็นที่จะชนะ')
 else:
-    st.warning(f'WAIT / NO TRADE — {entry_reason}')
-    st.caption(f'Engine gate: {gate_reason} • Entry filter: {entry_reason}')
+    st.warning(f'WAIT / NO TRADE — {gate_reason}')
+    st.write(f'Setup Readiness: **{setup_readiness}/100**')
+    st.write('Setup Readiness components: ' + ' • '.join(f'{k} {v}/100' for k,v in quality_parts.items()))
+    st.info(f'ต้องรอ: {gate_reason}')
+    st.caption('Setup Readiness คือความพร้อมของ setup ไม่ใช่ความน่าจะเป็นที่จะชนะ และคำนวณได้แม้ยังไม่มี ENTRY READY')
 
-# Record the current setup once per M30 signal bar. The journal lives in the current Streamlit session.
-if risk:
-    update_journal(symbol,mode,vsignal,risk,last.name,d.close.iloc[-1],d.tail(1))
+# Journal uses the completed M30 signal bar and evaluates outcomes only on later M30 bars.
+# This is deliberately look-ahead-safe. Existing trades are updated even when the current setup is NO TRADE.
+update_journal(symbol,mode,vsignal,risk,last.name,d)
 
 st.subheader('Trade Journal / Statistics')
 jdf,jstats=journal_stats()
@@ -595,14 +643,14 @@ else:
     sc4.metric('Profit Factor',f"{jstats['Profit Factor']:.2f}" if np.isfinite(jstats.get('Profit Factor',np.nan)) else '—')
     sc5.metric('Max DD',f"{jstats['Max DD R']:.2f}R")
     sc6.metric('Open',jstats.get('Open',0))
-    show_cols=['Time','Symbol','Mode','Direction','Entry','SL','TP1','TP2','Status','Result R']
+    show_cols=['Signal ID','Signal Bar','Symbol','Mode','Direction','Entry','SL','TP1','TP2','Status','Result R']
     st.dataframe(jdf[show_cols].tail(20),hide_index=True,use_container_width=True)
     csv=jdf.to_csv(index=False).encode('utf-8-sig')
     st.download_button('ดาวน์โหลด Trade Journal CSV',csv,file_name='v42_trade_journal.csv',mime='text/csv',use_container_width=True)
     if st.button('ล้าง Journal ใน Session',use_container_width=True):
         st.session_state.trade_journal=[]
         st.rerun()
-    st.caption('Cooldown: 1 active setup ต่อ Symbol + Mode + Direction; สัญญาณใหม่จะไม่ถูกสร้างซ้ำจนกว่า setup เดิมจะจบ. Journal อยู่ใน session นี้เท่านั้น')
+    st.caption('Cooldown: 1 active setup ต่อ Symbol + Mode + Direction. Signal ID ผูกกับแท่ง M30 ที่ปิดแล้ว; ผลลัพธ์จะตรวจเฉพาะแท่ง M30 หลัง Entry. Journal อยู่ใน session นี้เท่านั้น')
 
 st.subheader(f'Top-Down Multi-Timeframe — {mode}')
 rows=[]
@@ -625,4 +673,4 @@ st.dataframe(pd.DataFrame([
     ['RSI14',float(last.RSI)],['MACD',float(last.MACD)],['MACD Signal',float(last.MACDsig)],['ATR14',float(last.ATR)],['ATR %',float(last.ATR_pct)]
 ],columns=['Indicator','Value']),hide_index=True,use_container_width=True)
 
-st.caption('V4.2.1 ไม่ส่งคำสั่งซื้อขายอัตโนมัติ. M30 คือ timeframe หลัก; M5 เป็น order-flow proxy. Short Hold: สัญญาณแคบ/เข้าเร็วกว่า. Long Hold: โครงสร้างกว้าง/ถือยาวกว่า. Score/Confidence ไม่ใช่ win probability.')
+st.caption('V4.2.2 ไม่ส่งคำสั่งซื้อขายอัตโนมัติ. M30 คือ timeframe หลัก; M5 เป็น order-flow proxy. Short Hold: สัญญาณแคบ/เข้าเร็วกว่า. Long Hold: โครงสร้างกว้าง/ถือยาวกว่า. Score/Confidence ไม่ใช่ win probability.')
