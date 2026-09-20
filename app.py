@@ -393,7 +393,7 @@ def entry_quality(frames, direction, mode, flow, loc, vp, risk, vscore, alignmen
     confirm=100-int(np.clip(abs(fs-(78 if base=='LONG' else 22))*2.0,0,100))
     if mode=='1 — Short Hold':
         confirm=int(np.clip(100-abs(fs-(82 if base=='LONG' else 18))*2.2,0,100))
-    loc_text=(risk.get('location') or '')
+    loc_text=((risk or {}).get('location') or '')
     location=100 if (('discount' in loc_text.lower() or 'inside value' in loc_text.lower()) if base=='LONG' else ('premium' in loc_text.lower() or 'inside value' in loc_text.lower())) else 55
     if risk:
         rr=min(float(risk.get('rr2',0))/3.0*100,100)
