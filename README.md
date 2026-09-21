@@ -1,23 +1,31 @@
 Gold & Bitcoin Trading Analyzer — V4.2.2
-V4.2.2 keeps the M30-primary two-horizon design and makes the journal look-ahead-safe.
-Core structure
-D1 → H4 → H1 → M30 setup → M5 proxy confirmation
-Modes
-Short Hold: narrower setup, stronger M5 confirmation, tighter risk, TP1 1.25R / TP2 2R
-Long Hold: wider setup, H1/H4 + M30 structure, M5 is confirmatory, TP1 1.5R / TP2 3R
-V4.2.2 changes
-Uses completed candles for signal generation; the newest forming candle is excluded from analysis.
-Replaces Entry Quality display with Setup Readiness to distinguish setup readiness from trend strength.
-Shows Setup Readiness even when the signal is NO TRADE.
-Signal ID includes the completed M30 signal bar.
-Journal evaluates outcomes only on M30 bars strictly after the signal bar, preventing look-ahead from the signal candle.
-If SL and TP1/TP2 are both touched in the same M30 bar, status becomes BOTH TOUCHED — REVIEW because intrabar order is unknown.
-Existing trades continue to be evaluated even when the current setup changes to NO TRADE.
-Journal includes Signal ID and Signal Bar.
-Data limitations
-M5 is a candle/relative-volume proxy. It is not true bid/ask delta, footprint, DOM, or centralized futures order-flow data.
-The app uses Twelve Data REST polling and does not place orders automatically.
-Streamlit Secrets
-Set:
-TWELVEDATA_API_KEY = "your_private_key"
-Do not put the key in GitHub source code.
+V4.2.2 is an M30-primary analyzer with both holding horizons shown at the same time. No Short/Long mode selector is required.
+Dashboard behavior
+BTC/USD is first in the asset selector.
+Short Hold and Long Hold are calculated and displayed together.
+The user can still choose the asset and main chart timeframe.
+M30 is the primary setup timeframe.
+M5 is a candle/relative-volume proxy confirmation, not true footprint, bid/ask delta, or DOM.
+Horizons
+Short Hold
+Narrower setup.
+M30 setup + stronger M5 proxy confirmation.
+Tighter invalidation.
+TP1 = 1.25R, TP2 = 2.0R.
+Long Hold
+Wider structure.
+D1/H4 regime with H1/M30 confirmation.
+M5 can weaken the score but does not veto by itself.
+Wider invalidation.
+TP1 = 1.5R, TP2 = 3.0R.
+Readiness and journal
+Trend Score is separate from Setup Readiness.
+Setup Readiness is shown even when there is no trade.
+Signal IDs use the completed M30 signal bar.
+Trade outcomes are evaluated only on M30 bars after the signal bar to avoid look-ahead.
+Journal evaluation is restricted to the matching symbol, so BTC and Gold trades are not cross-evaluated.
+If one bar touches both stop and target, the result is marked BOTH TOUCHED — REVIEW.
+Data
+Twelve Data REST API.
+API key must be stored in Streamlit Secrets as TWELVEDATA_API_KEY.
+No automatic order placement.
