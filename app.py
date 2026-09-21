@@ -9,7 +9,7 @@ import plotly.graph_objects as go
 st.set_page_config(page_title='Gold & BTC Trading Analyzer V4.2.2', page_icon='📈', layout='wide')
 
 BASE = 'https://api.twelvedata.com'
-ASSETS = {'Gold XAU/USD': 'XAU/USD', 'Bitcoin BTC/USD': 'BTC/USD'}
+ASSETS = {'Bitcoin BTC/USD': 'BTC/USD', 'Gold XAU/USD': 'XAU/USD'}
 TF = {'5m':'5min','15m':'15min','30m':'30min','1h':'1h','4h':'4h','1D':'1day'}
 ANALYSIS_TFS = ['1D','4h','1h','30m']
 
@@ -475,7 +475,8 @@ def update_journal(symbol, mode, direction, risk, signal_bar, m30_bars):
 
     # Always advance existing trades, even when the current setup is NO TRADE.
     for trade in st.session_state.trade_journal:
-        _evaluate_trade_on_bars(trade,m30_bars)
+        if trade.get('Symbol') == symbol:
+            _evaluate_trade_on_bars(trade,m30_bars)
 
     if not risk or direction=='NO TRADE':
         return
@@ -517,12 +518,11 @@ def journal_stats():
 def fmt(v): return f'{v:,.4f}'
 
 st.title('Gold & Bitcoin Trading Analyzer — V4.2.2')
-st.caption('V4.2.2 = M30-primary + 2 horizons + Setup Readiness + look-ahead-safe journal. M5 is a proxy confirmation, not true footprint/delta/DOM.')
+st.caption('V4.2.2 = M30-primary + Short Hold + Long Hold พร้อมกัน + Setup Readiness + look-ahead-safe journal. M5 เป็น proxy confirmation ไม่ใช่ true footprint/delta/DOM.')
 
 with st.sidebar:
     st.header('ตั้งค่าการวิเคราะห์')
-    mode=st.radio('โหมดการถือ', ['1 — Short Hold','2 — Long Hold'], index=0, help='Short Hold = สัญญาณแคบและ M5 ต้องยืนยันแรง; Long Hold = ถือยาวกว่า ใช้ H1/H4 และ M30 เป็นหลัก')
-    asset=st.selectbox('สินทรัพย์',list(ASSETS.keys()),index=0)
+    asset=st.selectbox('สินทรัพย์',list(ASSETS.keys()),index=0, help='เรียง BTC/USD ก่อนตามที่กำหนด')
     timeframe=st.selectbox('Timeframe หลัก',list(TF.keys()),index=2)
     outputsize=st.select_slider('จำนวนแท่ง',options=[300,500,800],value=500)
     auto=st.checkbox('Auto refresh',value=False)
@@ -558,7 +558,6 @@ for tf in ANALYSIS_TFS:
     else: errors[tf]=er or 'ข้อมูลไม่พอ'
 
 # 30m is the primary setup timeframe; 5m is used only as the lowest-timeframe confirmation.
-# Only completed 5m candles are used for confirmation.
 five_df,five_err=get_ohlcv(symbol,'5min',max(250,min(800,outputsize)))
 if not five_err and len(five_df)>=40:
     five_full=add_indicators(five_df)
@@ -568,36 +567,71 @@ else:
 flow=proxy_orderflow(five)
 loc=fib_location(five if not five.empty else d)
 vp=volume_profile_proxy(five if not five.empty else d)
-
 env,env_score,env_reason=environment(frames.get('4h',d))
-vsignal,vscore,alignment,details,gate_reason=v42_engine(frames,mode,flow)
-risk,entry_reason=entry_plan(frames,vsignal,support,resistance,mode,flow,loc,vp) if vsignal!='NO TRADE' else (None,'NO TRADE')
-setup_readiness,quality_parts=entry_quality(frames,vsignal,mode,flow,loc,vp,risk,vscore,alignment,details)
 regime=env
 
-confidence=int(np.clip(.55*vscore+.25*alignment+.20*abs(flow['score']-50)*2,50,99)) if vsignal!='NO TRADE' else 0
+# Run both horizons at the same time. No mode selector is needed.
+mode_defs=[('1 — Short Hold','Short Hold'),('2 — Long Hold','Long Hold')]
+results={}
+for mode, label in mode_defs:
+    vsignal,vscore,alignment,details,gate_reason=v42_engine(frames,mode,flow)
+    risk,entry_reason=entry_plan(frames,vsignal,support,resistance,mode,flow,loc,vp) if vsignal!='NO TRADE' else (None,gate_reason)
+    setup_readiness,quality_parts=entry_quality(frames,vsignal,mode,flow,loc,vp,risk,vscore,alignment,details)
+    confidence=int(np.clip(.55*vscore+.25*alignment+.20*abs(flow['score']-50)*2,50,99)) if vsignal!='NO TRADE' else 0
+    results[label]={
+        'mode':mode,'signal':vsignal,'score':vscore,'alignment':alignment,
+        'details':details,'gate_reason':gate_reason,'risk':risk,
+        'entry_reason':entry_reason,'status_reason':(entry_reason if risk is None else gate_reason),'readiness':setup_readiness,
+        'quality_parts':quality_parts,'confidence':confidence
+    }
 
-c1,c2,c3,c4,c5,c6=st.columns(6)
+# Update the journal for both horizons. Existing trades are still advanced only with
+# bars belonging to the same symbol, preventing cross-asset evaluation.
+for label in ('Short Hold','Long Hold'):
+    r=results[label]
+    update_journal(symbol,r['mode'],r['signal'],r['risk'],last.name,d)
+
+c1,c2,c3,c4=st.columns(4)
 c1.metric('Price',fmt(price),f'{pct:+.2f}%')
-c2.metric('V4.2.2 Signal',vsignal)
-c3.metric('Trend Score',f'{vscore}/100')
-c4.metric('Setup Readiness',f'{setup_readiness}/100')
-c5.metric('Confidence',f'{confidence}%' if confidence else '—')
-c6.metric('RSI',f'{last.RSI:.1f}')
-st.caption(f'แท่งล่าสุด: {last.name.strftime("%Y-%m-%d %H:%M UTC")} • {symbol} • {timeframe}')
+c2.metric('Environment',f'{env}')
+c3.metric('5m Proxy Flow',f'{flow["score"]}/100',flow['state'])
+c4.metric('RSI',f'{last.RSI:.1f}')
+st.caption(f'แท่งวิเคราะห์ล่าสุด: {last.name.strftime("%Y-%m-%d %H:%M UTC")} • {symbol} • {timeframe}')
+
+st.subheader(f'สถานะพร้อมกัน — {asset}')
+sc1,sc2=st.columns(2)
+for col,label in ((sc1,'Short Hold'),(sc2,'Long Hold')):
+    r=results[label]
+    with col:
+        st.markdown(f'### {label}')
+        if r['signal']!='NO TRADE' and r['risk']:
+            st.success(f'{r["signal"]}')
+        else:
+            st.warning('NO TRADE')
+        m1,m2,m3=st.columns(3)
+        m1.metric('Trend',f'{r["score"]}/100')
+        m2.metric('Readiness',f'{r["readiness"]}/100')
+        m3.metric('Confidence',f'{r["confidence"]}%' if r['confidence'] else '—')
+        if r['risk']:
+            rr=r['risk']
+            st.write(f'Entry **{fmt(rr["entry"])}** • SL **{fmt(rr["sl"])}**')
+            st.write(f'TP1 **{fmt(rr["tp1"])}** ({rr["rr1"]:.2f}R) • TP2 **{fmt(rr["tp2"])}** ({rr["rr2"]:.2f}R)')
+            st.caption(f'Setup: {rr["setup"]} • Flow: {rr["flow_score"]}/100')
+        else:
+            st.write(f'ต้องรอ: **{r["status_reason"]}**')
+        st.write('Readiness: ' + ' • '.join(f'{k} {v}/100' for k,v in r['quality_parts'].items()))
+        st.caption('Readiness = ความพร้อมของ setup ไม่ใช่ win probability')
 
 fig=go.Figure(); fig.add_trace(go.Candlestick(x=d.index,open=d.open,high=d.high,low=d.low,close=d.close,name=symbol))
 for col in ['EMA20','EMA50','EMA200']: fig.add_trace(go.Scatter(x=d.index,y=d[col],name=col,mode='lines'))
 fig.add_hline(y=support,annotation_text='Support',line_dash='dot'); fig.add_hline(y=resistance,annotation_text='Resistance',line_dash='dot')
-if vp:
-    fig.add_hline(y=vp['poc'],annotation_text='Proxy POC',line_dash='dash')
+if vp: fig.add_hline(y=vp['poc'],annotation_text='Proxy POC',line_dash='dash')
 fig.update_layout(height=620,xaxis_rangeslider_visible=False,margin=dict(l=10,r=10,t=30,b=10)); st.plotly_chart(fig,use_container_width=True)
 
 left,right=st.columns(2)
 with left:
-    st.subheader('V4.2 Environment / Location')
+    st.subheader('Environment / Location')
     st.write(f'Environment: **{env}** ({env_score}/100)')
-    st.write(f'Regime filter: **{"PASS" if (vsignal!="NO TRADE" and risk) else "WAIT"}**')
     st.write(f'Path/session: **{session_label(last.name)}**')
     st.write(f'Fib location: **{loc.get("label","N/A")}**')
     if 'z705' in loc: st.write(f'Fib 0.705 / 0.788 / 0.886: **{fmt(loc["z705"])} / {fmt(loc["z788"])} / {fmt(loc["z886"])}**')
@@ -609,27 +643,22 @@ with right:
     st.write(' • '.join(flow['reasons']) if flow['reasons'] else 'ยังไม่พบ confirmation')
     st.caption('ใช้ candle + relative volume เป็น proxy เท่านั้น; ไม่ใช่ bid/ask delta, footprint หรือ DOM')
 
-st.subheader('Entry / SL / TP')
-if risk:
-    st.success(f'ENTRY READY — {risk["direction"]}')
-    st.write(f'Entry: **{fmt(risk["entry"])}**')
-    st.write(f'Stop Loss: **{fmt(risk["sl"])}**')
-    st.write(f'TP1: **{fmt(risk["tp1"])}** (R:R 1:{risk["rr1"]:.1f})')
-    st.write(f'TP2: **{fmt(risk["tp2"])}** (R:R 1:{risk["rr2"]:.1f})')
-    st.caption(f'Risk/Unit: {fmt(risk["risk"])} • Setup: {risk["setup"]} • Flow: {risk["flow_score"]}/100')
-    st.caption(f'Signal ID: {_signal_id(symbol,mode,risk)}')
-    st.write('Setup Readiness components: ' + ' • '.join(f'{k} {v}/100' for k,v in quality_parts.items()))
-    st.caption('Setup Readiness คือความพร้อมของ setup ไม่ใช่ความน่าจะเป็นที่จะชนะ')
-else:
-    st.warning(f'WAIT / NO TRADE — {gate_reason}')
-    st.write(f'Setup Readiness: **{setup_readiness}/100**')
-    st.write('Setup Readiness components: ' + ' • '.join(f'{k} {v}/100' for k,v in quality_parts.items()))
-    st.info(f'ต้องรอ: {gate_reason}')
-    st.caption('Setup Readiness คือความพร้อมของ setup ไม่ใช่ความน่าจะเป็นที่จะชนะ และคำนวณได้แม้ยังไม่มี ENTRY READY')
-
-# Journal uses the completed M30 signal bar and evaluates outcomes only on later M30 bars.
-# This is deliberately look-ahead-safe. Existing trades are updated even when the current setup is NO TRADE.
-update_journal(symbol,mode,vsignal,risk,last.name,d)
+st.subheader('รายละเอียด Entry / SL / TP')
+d1,d2=st.columns(2)
+for col,label in ((d1,'Short Hold'),(d2,'Long Hold')):
+    r=results[label]
+    with col:
+        st.markdown(f'**{label}**')
+        if r['risk']:
+            rr=r['risk']
+            st.write(f'ENTRY READY — **{rr["direction"]}**')
+            st.write(f'Entry: **{fmt(rr["entry"])}**')
+            st.write(f'SL: **{fmt(rr["sl"])}**')
+            st.write(f'TP1: **{fmt(rr["tp1"])}** • TP2: **{fmt(rr["tp2"])}**')
+            st.caption(f'Risk/Unit: {fmt(rr["risk"])} • Signal ID: {_signal_id(symbol,r["mode"],rr,last.name)}')
+        else:
+            st.write(f'WAIT / NO TRADE — **{r["status_reason"]}**')
+        st.write(' • '.join(f'{k} {v}/100' for k,v in r['quality_parts'].items()))
 
 st.subheader('Trade Journal / Statistics')
 jdf,jstats=journal_stats()
@@ -650,14 +679,17 @@ else:
     if st.button('ล้าง Journal ใน Session',use_container_width=True):
         st.session_state.trade_journal=[]
         st.rerun()
-    st.caption('Cooldown: 1 active setup ต่อ Symbol + Mode + Direction. Signal ID ผูกกับแท่ง M30 ที่ปิดแล้ว; ผลลัพธ์จะตรวจเฉพาะแท่ง M30 หลัง Entry. Journal อยู่ใน session นี้เท่านั้น')
+    st.caption('Cooldown: 1 active setup ต่อ Symbol + Mode + Direction. Signal ID ผูกกับแท่ง M30 ที่ปิดแล้ว; ผลลัพธ์ตรวจเฉพาะแท่ง M30 หลัง Entry. Journal อยู่ใน session นี้เท่านั้น')
 
-st.subheader(f'Top-Down Multi-Timeframe — {mode}')
+st.subheader(f'Top-Down Multi-Timeframe — {asset}')
+# Show both horizons in one table, so the user can compare without switching modes.
 rows=[]
 for tf in ANALYSIS_TFS:
-    if tf in details:
-        z=details[tf]; rows.append([tf,z['Bias'],z['Strength'],z['Structure'],z['Environment'],z['EnvScore'],z['Reason']])
-    else: rows.append([tf,'ERROR','—','—','—','—',errors.get(tf,'ไม่มีข้อมูล')])
+    if tf in results['Short Hold']['details']:
+        z=results['Short Hold']['details'][tf]
+        rows.append([tf,z['Bias'],z['Strength'],z['Structure'],z['Environment'],z['EnvScore'],z['Reason']])
+    else:
+        rows.append([tf,'ERROR','—','—','—','—',errors.get(tf,'ไม่มีข้อมูล')])
 st.dataframe(pd.DataFrame(rows,columns=['TF','Bias','Strength','Structure','Environment','EnvScore','Reason']),hide_index=True,use_container_width=True)
 
 st.subheader('Current Setup')
@@ -673,4 +705,4 @@ st.dataframe(pd.DataFrame([
     ['RSI14',float(last.RSI)],['MACD',float(last.MACD)],['MACD Signal',float(last.MACDsig)],['ATR14',float(last.ATR)],['ATR %',float(last.ATR_pct)]
 ],columns=['Indicator','Value']),hide_index=True,use_container_width=True)
 
-st.caption('V4.2.2 ไม่ส่งคำสั่งซื้อขายอัตโนมัติ. M30 คือ timeframe หลัก; M5 เป็น order-flow proxy. Short Hold: สัญญาณแคบ/เข้าเร็วกว่า. Long Hold: โครงสร้างกว้าง/ถือยาวกว่า. Score/Confidence ไม่ใช่ win probability.')
+st.caption('V4.2.2 ไม่ส่งคำสั่งซื้อขายอัตโนมัติ. M30 คือ timeframe หลัก; M5 เป็น order-flow proxy. Short Hold และ Long Hold แสดงพร้อมกัน ไม่ต้องเลือกโหมด. BTC/USD อยู่ลำดับแรกในรายการสินทรัพย์. Score/Confidence ไม่ใช่ win probability.')
