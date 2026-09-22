@@ -5,7 +5,7 @@ import requests
 import streamlit as st
 import plotly.graph_objects as go
 
-st.set_page_config(page_title='Gold & Bitcoin Trading Analyzer V4.5', page_icon='📈', layout='wide')
+st.set_page_config(page_title='Gold & Bitcoin Trading Analyzer V4.6', page_icon='📈', layout='wide')
 
 BASE = 'https://api.twelvedata.com'
 ASSETS = {'Bitcoin BTC/USD': 'BTC/USD', 'Gold XAU/USD': 'XAU/USD'}
@@ -159,66 +159,112 @@ def macro_context(d1, h4, h1, m15):
     }
 
 
-def m15_setup(d, tactical):
-    if d is None or len(d) < 80 or tactical == 'NEUTRAL':
-        return {'ok': False, 'near': False, 'score': 0, 'name': 'รอ M15 setup', 'type': 'NONE'}
-    x, p = d.iloc[-1], d.iloc[-2]
-    atr = max(float(x.ATR), 1e-9); rg = max(float(x.range), 1e-9)
-    hi20 = float(d.iloc[-21:-1].high.max()); lo20 = float(d.iloc[-21:-1].low.min())
-    ema20, ema50 = float(x.EMA20), float(x.EMA50)
-    dist20 = abs(float(x.close) - ema20) / atr
+def _m15_candidate(row, prior, tactical, d):
+    atr = max(float(row.ATR), 1e-9)
+    rg = max(float(row.range), 1e-9)
+    ema20, ema50 = float(row.EMA20), float(row.EMA50)
+    hi20 = float(d.iloc[-21:-1].high.max())
+    lo20 = float(d.iloc[-21:-1].low.min())
+    recent_low = float(d.iloc[-8:-1].low.min())
+    recent_high = float(d.iloc[-8:-1].high.max())
 
-    bull_pull = x.low <= ema20 + 0.55*atr and x.close > ema20 and x.close > x.open and x.close >= x.low + 0.55*rg
-    bear_pull = x.high >= ema20 - 0.55*atr and x.close < ema20 and x.close < x.open and x.close <= x.high - 0.55*rg
-    bull_sweep = x.low < float(d.iloc[-8:-1].low.min()) and x.close > float(d.iloc[-8:-1].low.min()) and x.close > x.open
-    bear_sweep = x.high > float(d.iloc[-8:-1].high.max()) and x.close < float(d.iloc[-8:-1].high.max()) and x.close < x.open
-    bull_break = x.close > hi20 and x.close > x.open and x.body_ratio >= 0.35
-    bear_break = x.close < lo20 and x.close < x.open and x.body_ratio >= 0.35
-    bull_cont = x.close > x.EMA20 and x.EMA20 >= x.EMA50 and x.low > float(d.iloc[-4:-1].low.min())
-    bear_cont = x.close < x.EMA20 and x.EMA20 <= x.EMA50 and x.high < float(d.iloc[-4:-1].high.max())
+    bull_pull = row.low <= ema20 + 0.75*atr and row.close >= ema20 and row.close > row.open and row.close >= row.low + 0.50*rg
+    bear_pull = row.high >= ema20 - 0.75*atr and row.close <= ema20 and row.close < row.open and row.close <= row.high - 0.50*rg
+    bull_sweep = row.low < recent_low and row.close > recent_low and row.close > row.open
+    bear_sweep = row.high > recent_high and row.close < recent_high and row.close < row.open
+    bull_break = row.close > hi20 and row.close > row.open and row.body_ratio >= 0.30
+    bear_break = row.close < lo20 and row.close < row.open and row.body_ratio >= 0.30
+    bull_cont = row.close > ema20 and ema20 >= ema50*0.998 and row.low > float(d.iloc[-4:-1].low.min())
+    bear_cont = row.close < ema20 and ema20 <= ema50*1.002 and row.high < float(d.iloc[-4:-1].high.max())
 
-    names = []
     if tactical == 'LONG':
-        if bull_pull and ema20 >= ema50 * 0.997: names.append('M15 pullback')
+        names=[]
+        if bull_pull: names.append('M15 pullback')
         if bull_sweep: names.append('M15 sweep-reclaim')
         if bull_break: names.append('M15 breakout')
         if bull_cont: names.append('M15 continuation')
     else:
-        if bear_pull and ema20 <= ema50 * 1.003: names.append('M15 pullback')
+        names=[]
+        if bear_pull: names.append('M15 pullback')
         if bear_sweep: names.append('M15 sweep-reject')
         if bear_break: names.append('M15 breakdown')
         if bear_cont: names.append('M15 continuation')
+    return names
 
-    near = dist20 <= 1.05 or (tactical == 'LONG' and x.close >= ema20) or (tactical == 'SHORT' and x.close <= ema20)
-    if names:
-        return {'ok': True, 'near': False, 'score': min(100, 60 + 10*len(names)), 'name': ' + '.join(names), 'type': names[0]}
-    if near:
-        return {'ok': False, 'near': True, 'score': 55, 'name': 'M15 near setup zone', 'type': 'NEAR'}
-    return {'ok': False, 'near': False, 'score': 35, 'name': 'รอ M15 pullback / breakout / sweep / continuation', 'type': 'NONE'}
+
+def m15_setup(d, tactical):
+    if d is None or len(d) < 80 or tactical == 'NEUTRAL':
+        return {'ok': False, 'near': False, 'score': 0, 'name': 'รอ M15 setup', 'type': 'NONE'}
+
+    # Look at the last 3 CLOSED candles. This avoids requiring the exact setup to occur on one candle only.
+    candidates=[]
+    for off in (0,1,2):
+        sub=d if off==0 else d.iloc[:-off]
+        if len(sub) < 30: continue
+        names=_m15_candidate(sub.iloc[-1], sub.iloc[-2], tactical, sub)
+        for n in names:
+            candidates.append((off,n))
+    if candidates:
+        # Prefer the newest qualifying setup, then the strongest multi-pattern candle.
+        newest=min(o for o,_ in candidates)
+        names=[]
+        for off,n in candidates:
+            if off==newest and n not in names: names.append(n)
+        return {'ok': True, 'near': False, 'score': min(100, 62 + 8*len(names)), 'name': ' + '.join(names), 'type': names[0]}
+
+    x=d.iloc[-1]; atr=max(float(x.ATR),1e-9)
+    dist20=abs(float(x.close)-float(x.EMA20))/atr
+    near=dist20 <= 1.25
+    return {'ok': False, 'near': near, 'score': 52 if near else 35,
+            'name': 'M15 ใกล้ setup zone' if near else 'รอ M15 pullback / breakout / sweep / continuation', 'type':'NEAR' if near else 'NONE'}
 
 
 def m5_trigger(d, direction):
-    if d is None or len(d) < 40 or direction == 'NEUTRAL':
+    if d is None or len(d) < 50 or direction == 'NEUTRAL':
         return {'ok': False, 'score': 0, 'name': 'รอ M5 trigger', 'type': 'NONE'}
-    x, p = d.iloc[-1], d.iloc[-2]
-    rg = max(float(x.range), 1e-9)
-    vr = float(x.VolRatio) if np.isfinite(x.VolRatio) else 1.0
-    bull_break = x.close > p.high and x.close > x.open and x.body_ratio >= 0.25
-    bear_break = x.close < p.low and x.close < x.open and x.body_ratio >= 0.25
-    bull_reclaim = x.close > x.EMA20 and p.close <= p.EMA20 and x.close > x.open
-    bear_reclaim = x.close < x.EMA20 and p.close >= p.EMA20 and x.close < x.open
-    bull_reject = x.lower_wick >= 0.25*rg and x.close > x.open and x.close >= x.low + 0.60*rg
-    bear_reject = x.upper_wick >= 0.25*rg and x.close < x.open and x.close <= x.high - 0.60*rg
-    if direction == 'LONG':
-        points = 40*int(bull_break) + 35*int(bull_reclaim) + 25*int(bull_reject) + 10*int(vr >= 1.05)
-        score = int(min(100, points + (30 if x.close > x.EMA20 else 0)))
-        ok = score >= 65
-        return {'ok': ok, 'score': score, 'name': 'M5 bullish trigger' if ok else 'รอ M5 กลับขึ้น', 'type': 'LONG' if ok else 'NONE'}
-    points = 40*int(bear_break) + 35*int(bear_reclaim) + 25*int(bear_reject) + 10*int(vr >= 1.05)
-    score = int(min(100, points + (30 if x.close < x.EMA20 else 0)))
-    ok = score >= 65
-    return {'ok': ok, 'score': score, 'name': 'M5 bearish trigger' if ok else 'รอ M5 กลับลง', 'type': 'SHORT' if ok else 'NONE'}
 
+    # Evaluate the last 3 closed candles so a valid trigger is not missed between refreshes.
+    best=None
+    for off in (0,1,2):
+        sub=d if off==0 else d.iloc[:-off]
+        if len(sub) < 25: continue
+        x,p=sub.iloc[-1],sub.iloc[-2]
+        rg=max(float(x.range),1e-9)
+        vr=float(x.VolRatio) if np.isfinite(x.VolRatio) else 1.0
+        bull_break=x.close>p.high and x.close>x.open and x.body_ratio>=0.20
+        bear_break=x.close<p.low and x.close<x.open and x.body_ratio>=0.20
+        bull_reclaim=x.close>x.EMA20 and p.close<=p.EMA20 and x.close>x.open
+        bear_reclaim=x.close<x.EMA20 and p.close>=p.EMA20 and x.close<x.open
+        bull_reject=x.lower_wick>=0.20*rg and x.close>x.open and x.close>=x.low+0.55*rg
+        bear_reject=x.upper_wick>=0.20*rg and x.close<x.open and x.close<=x.high-0.55*rg
+        if direction=='LONG':
+            score=min(100, 40*int(bull_break)+35*int(bull_reclaim)+25*int(bull_reject)+10*int(vr>=1.0)+20*int(x.close>x.EMA20))
+            name='M5 bullish trigger'
+        else:
+            score=min(100, 40*int(bear_break)+35*int(bear_reclaim)+25*int(bear_reject)+10*int(vr>=1.0)+20*int(x.close<x.EMA20))
+            name='M5 bearish trigger'
+        if best is None or score>best[0]: best=(score,name,off)
+    if best is None: return {'ok':False,'score':0,'name':'รอ M5 trigger','type':'NONE'}
+    score,name,off=best
+    ok=score>=55
+    return {'ok':ok,'score':int(score),'name':name if ok else ('รอ M5 กลับขึ้น' if direction=='LONG' else 'รอ M5 กลับลง'),'type':direction if ok else 'NONE'}
+
+
+def range_location(h4,h1,direction):
+    if direction not in ('LONG','SHORT'):
+        return {'score':50,'zone':'MIXED','reason':'ยังไม่มี direction'}
+    r4=range_info(h4,48); r1=range_info(h1,48)
+    zones=[r4['zone'],r1['zone']]
+    if direction=='LONG':
+        if zones.count('LOWER RANGE')==2: return {'score':90,'zone':'LOWER RANGE','reason':'H4/H1 อยู่โซนล่าง เหมาะกับการหาจังหวะ Long'}
+        if 'LOWER RANGE' in zones: return {'score':75,'zone':'LOWER/MID','reason':'มีอย่างน้อยหนึ่ง TF อยู่โซนล่าง'}
+        if zones.count('UPPER RANGE')==2: return {'score':30,'zone':'UPPER RANGE','reason':'ราคาอยู่โซนบนของ H4/H1 ไม่เหมาะกับการไล่ Long'}
+        return {'score':55,'zone':'MID RANGE','reason':'H4/H1 อยู่กลาง range'}
+    else:
+        if zones.count('UPPER RANGE')==2: return {'score':90,'zone':'UPPER RANGE','reason':'H4/H1 อยู่โซนบน เหมาะกับการหาจังหวะ Short'}
+        if 'UPPER RANGE' in zones: return {'score':75,'zone':'UPPER/MID','reason':'มีอย่างน้อยหนึ่ง TF อยู่โซนบน'}
+        if zones.count('LOWER RANGE')==2: return {'score':30,'zone':'LOWER RANGE','reason':'ราคาอยู่โซนล่าง ไม่เหมาะกับการไล่ Short'}
+        return {'score':55,'zone':'MID RANGE','reason':'H4/H1 อยู่กลาง range'}
 
 def make_plan(frames, direction, mode):
     m5, m15, h1, h4 = frames['5m'], frames['15m'], frames['1h'], frames['4h']
@@ -258,55 +304,60 @@ def make_plan(frames, direction, mode):
 
 def evaluate(frames, mode):
     ctx = macro_context(frames['1D'], frames['4h'], frames['1h'], frames['15m'])
-    m15s = ctx['tactical']
-    setup = m15_setup(frames['15m'], m15s)
-    trig = m5_trigger(frames['5m'], m15s)
-    r15 = range_info(frames['15m'], 48)
+    # H4/H1 define the tactical range; M15 defines the setup; M5 defines the entry trigger.
+    tactical = ctx['tactical']
+    short_dir = tactical
+    short_loc = range_location(frames['4h'], frames['1h'], short_dir)
+    short_setup = m15_setup(frames['15m'], short_dir)
+    short_trig = m5_trigger(frames['5m'], short_dir)
 
-    # Short Hold follows tactical direction. It may be counter-macro, but labels it explicitly.
+    macro = ctx['macro']
+    long_loc = range_location(frames['4h'], frames['1h'], macro)
+    long_setup = m15_setup(frames['15m'], macro)
+    long_trig = m5_trigger(frames['5m'], macro)
+
     if mode == 'Short Hold':
-        direction = m15s
+        direction=short_dir
         if direction == 'NEUTRAL':
-            status = 'WAIT'; reason = 'H1/M15 ยังไม่ให้ทิศทาง'
-        elif setup['ok'] and trig['ok']:
-            status = 'ENTRY READY'; reason = f"{setup['name']} • {trig['name']}"
-        elif setup['ok'] or setup['near']:
-            status = 'PRE-ENTRY'; reason = f"{setup['name']} • {trig['name']}"
+            status='WAIT'; reason='H1/M15 ยังไม่ให้ tactical direction'
+        elif short_setup['ok'] and short_trig['ok']:
+            status='ENTRY READY'; reason=f"{short_setup['name']} • {short_trig['name']} • {short_loc['zone']}"
+        elif short_setup['ok'] or short_setup['near']:
+            status='PRE-ENTRY'; reason=f"{short_setup['name']} • {short_trig['name']} • {short_loc['reason']}"
         else:
-            status = 'WAIT'; reason = setup['name']
+            status='WAIT'; reason=short_setup['name']
+        setup,trig,loc=short_setup,short_trig,short_loc
     else:
-        # Long Hold follows macro direction only. A tactical counter-move is treated as a pullback, not a long entry.
-        direction = ctx['macro']
+        direction=macro
         if direction == 'NEUTRAL':
-            status = 'WAIT'; reason = 'D1/H4 ยังไม่ให้ Macro direction'
-        elif ctx['tactical'] != direction:
-            status = 'PRE-ENTRY' if setup['ok'] and setup['type'] in ('M15 pullback','M15 sweep-reclaim','M15 sweep-reject') else 'WAIT'
-            reason = f"Macro {direction} • Tactical {ctx['tactical']} = pullback/rebound ภายใน Macro"
-        elif setup['ok']:
-            status = 'ENTRY READY' if trig['ok'] else 'PRE-ENTRY'
-            reason = f"{setup['name']} • {trig['name']}"
-        elif setup['near']:
-            status = 'PRE-ENTRY'; reason = 'M15 ใกล้ setup zone'
+            status='WAIT'; reason='D1/H4 ยังไม่ให้ Macro direction'
+        elif tactical != direction:
+            # Counter-macro movement is a pullback. Long Hold waits for M15 to resume macro direction.
+            status='ENTRY READY' if long_setup['ok'] and long_trig['ok'] else 'PRE-ENTRY' if long_setup['ok'] or long_setup['near'] else 'WAIT'
+            reason=f"Macro {direction} • Tactical {tactical} = pullback/rebound ภายใน Macro • {long_setup['name']} • {long_trig['name']}"
+        elif long_setup['ok'] and long_trig['ok']:
+            status='ENTRY READY'; reason=f"{long_setup['name']} • {long_trig['name']} • {long_loc['zone']}"
+        elif long_setup['ok'] or long_setup['near']:
+            status='PRE-ENTRY'; reason=f"{long_setup['name']} • {long_trig['name']}"
         else:
-            status = 'WAIT'; reason = setup['name']
+            status='WAIT'; reason=long_setup['name']
+        setup,trig,loc=long_setup,long_trig,long_loc
 
-    # A plan exists only for ENTRY READY. No premature Entry/SL/TP display.
-    plan = make_plan(frames, direction, mode) if status == 'ENTRY READY' else None
-    if status == 'ENTRY READY' and plan is None:
-        status = 'PRE-ENTRY'
-        reason = 'Setup พร้อม แต่ระยะ SL จากโครงสร้างกว้างเกินไป — รอราคาจัดโครงสร้างใหม่'
+    # Location is informative, not a hard veto. This prevents the previous engine from producing almost no entries.
+    readiness=int(np.clip(0.30*ctx['macro_strength'] + 0.25*ctx['tactical_strength'] + 0.20*setup['score'] + 0.15*trig['score'] + 0.10*loc['score'],0,100))
+    plan=make_plan(frames,direction,mode) if status=='ENTRY READY' else None
+    if status=='ENTRY READY' and plan is None:
+        status='PRE-ENTRY'; reason='สัญญาณครบ แต่โครงสร้าง SL กว้างเกินไป — รอราคาเข้าโครงสร้างใหม่'
 
-    relation = 'ALIGNED' if ctx['macro'] == ctx['tactical'] and ctx['macro'] != 'NEUTRAL' else 'COUNTER-MACRO' if ctx['macro'] != 'NEUTRAL' and ctx['tactical'] != 'NEUTRAL' else 'MIXED'
-    readiness = int(np.clip(0.35*ctx['macro_strength'] + 0.30*ctx['tactical_strength'] + 0.20*setup['score'] + 0.15*trig['score'], 0, 100))
+    relation='ALIGNED' if ctx['macro']==ctx['tactical'] and ctx['macro']!='NEUTRAL' else 'COUNTER-MACRO' if ctx['macro']!='NEUTRAL' and ctx['tactical']!='NEUTRAL' else 'MIXED'
     return {
-        'status': status, 'direction': direction, 'macro': ctx['macro'], 'tactical': ctx['tactical'],
-        'macro_strength': ctx['macro_strength'], 'tactical_strength': ctx['tactical_strength'],
-        'relation': relation, 'trend_d1': ctx['d1']['score'], 'h4_score': ctx['h4']['score'], 'h1_score': ctx['h1']['score'],
-        'alignment': int(round((ctx['h4']['score'] + ctx['h1']['score'])/2)),
-        'setup': setup, 'trigger': trig, 'range': r15, 'readiness': readiness, 'plan': plan, 'reason': reason,
-        'states': ctx,
+        'status':status,'direction':direction,'macro':ctx['macro'],'tactical':ctx['tactical'],
+        'macro_strength':ctx['macro_strength'],'tactical_strength':ctx['tactical_strength'],
+        'relation':relation,'trend_d1':ctx['d1']['score'],'h4_score':ctx['h4']['score'],'h1_score':ctx['h1']['score'],
+        'alignment':int(round((ctx['h4']['score']+ctx['h1']['score'])/2)),
+        'setup':setup,'trigger':trig,'range':range_info(frames['15m'],48),'location':loc,
+        'readiness':readiness,'plan':plan,'reason':reason,'states':ctx,
     }
-
 
 def fmt(v):
     return '—' if v is None or not np.isfinite(v) else f'{v:,.2f}'
@@ -322,7 +373,7 @@ def render_card(result, title):
     a.metric('Macro D1/H4', f"{result['macro']} {result['macro_strength']}/100")
     b.metric('Tactical H1/M15', f"{result['tactical']} {result['tactical_strength']}/100")
     c.metric('Setup Readiness', f"{result['readiness']}/100")
-    st.caption(f"Macro {result['macro']} • Tactical {result['tactical']} • {result['relation']} • M15 {result['setup']['name']} • M5 {result['trigger']['name']}")
+    st.caption(f"Macro {result['macro']} • Tactical {result['tactical']} • {result['relation']} • H4/H1 {result['location']['zone']} • M15 {result['setup']['name']} • M5 {result['trigger']['name']}")
     if pre:
         st.info(f"PRE-ENTRY: {result['reason']}")
     elif ready:
@@ -338,8 +389,8 @@ def render_card(result, title):
         st.caption('ยังไม่แสดง Entry / SL / TP จนกว่าจะเกิด ENTRY READY')
 
 
-st.title('Gold & Bitcoin Trading Analyzer — V4.5')
-st.caption('D1 Macro → H4 Macro structure → H1/M15 Tactical → M5 trigger. Short Hold และ Long Hold แสดงพร้อมกัน')
+st.title('Gold & Bitcoin Trading Analyzer — V4.6')
+st.caption('D1 trend → H4/H1 structure & range → M15 setup → M5 entry trigger. Short Hold และ Long Hold แสดงพร้อมกัน')
 
 with st.sidebar:
     st.header('ตั้งค่าการวิเคราะห์')
@@ -392,5 +443,5 @@ fig=go.Figure(); fig.add_trace(go.Candlestick(x=chart.index,open=chart.open,high
 for n in (20,50,200): fig.add_trace(go.Scatter(x=chart.index,y=chart[f'EMA{n}'],name=f'EMA{n}',mode='lines'))
 fig.update_layout(height=520,xaxis_rangeslider_visible=False,margin=dict(l=10,r=10,t=30,b=10)); st.plotly_chart(fig,use_container_width=True)
 
-st.markdown('## หลักการของ V4.5')
-st.write('D1/H4 = Macro direction. H1/M15 = Tactical direction และ setup. M5 = entry trigger. Short Hold follows tactical direction and may be counter-macro; Long Hold follows macro direction and treats H1/M15 counter-moves as pullbacks. สถานะมี WAIT → PRE-ENTRY → ENTRY READY และจะแสดง Entry/SL/TP เฉพาะ ENTRY READY เท่านั้น. ใช้เฉพาะแท่งที่ปิดแล้วในการวิเคราะห์.')
+st.markdown('## หลักการของ V4.6')
+st.write('D1 = แนวโน้มหลัก. H4/H1 = โครงสร้างและตำแหน่งใน range. M15 = setup. M5 = entry trigger. Short Hold ตาม tactical H1/M15 และ Long Hold ตาม macro D1/H4; ถ้า H1/M15 สวน Macro ให้ถือเป็น pullback/rebound และรอการกลับทิศบน M15/M5. ระบบตรวจ setup/trigger ย้อนหลัง 3 แท่งที่ปิดแล้วเพื่อไม่พลาดจังหวะระหว่างรอบ refresh. Entry/SL/TP แสดงเฉพาะ ENTRY READY.')
