@@ -1,4 +1,5 @@
 import os
+import time
 import numpy as np
 import pandas as pd
 import requests
@@ -11,6 +12,15 @@ BASE = 'https://api.twelvedata.com'
 ASSETS = {'Bitcoin BTC/USD': 'BTC/USD', 'Gold XAU/USD': 'XAU/USD'}
 TF = {'5m': '5min', '15m': '15min', '1h': '1h', '4h': '4h', '1D': '1day'}
 
+# Free-plan API keys are rate-limited (both requests/minute and requests/day).
+# These knobs keep the app usable on a free key: fewer requests per load, spaced
+# out client-side, cached longer, and with a fallback to the last good data
+# instead of a hard failure when a call is throttled.
+MIN_CALL_INTERVAL = 1.1      # seconds between outgoing API calls (client-side pacing)
+CACHE_TTL = 60                # seconds; also the practical floor for auto-refresh
+_last_call_ts = 0.0
+_LAST_GOOD = {}                # process-level fallback cache: {(symbol, interval): df}
+
 API_KEY = os.getenv('TWELVEDATA_API_KEY', '')
 try:
     if not API_KEY and 'TWELVEDATA_API_KEY' in st.secrets:
@@ -19,21 +29,42 @@ except Exception:
     pass
 
 
+def _pace_requests():
+    """Client-side spacing so a single page load doesn't burst all requests
+    at once and trip a free-plan per-minute rate limit."""
+    global _last_call_ts
+    now = time.monotonic()
+    wait = MIN_CALL_INTERVAL - (now - _last_call_ts)
+    if wait > 0:
+        time.sleep(wait)
+    _last_call_ts = time.monotonic()
+
+
 def api_get(endpoint, params):
     if not API_KEY:
         return None, 'ยังไม่ได้ตั้ง TWELVEDATA_API_KEY'
-    try:
-        r = requests.get(f'{BASE}/{endpoint}', params=params, timeout=20)
-        data = r.json()
-    except Exception as exc:
-        return None, f'เชื่อมต่อ Twelve Data ไม่สำเร็จ: {exc}'
-    if r.status_code != 200 or ('code' in data and data.get('code', 200) >= 400):
-        return None, data.get('message', 'Twelve Data API error')
-    return data, None
+    last_err = 'Twelve Data API error'
+    for attempt in range(2):  # one retry on rate-limit/transient failure
+        _pace_requests()
+        try:
+            r = requests.get(f'{BASE}/{endpoint}', params=params, timeout=20)
+            data = r.json()
+        except Exception as exc:
+            last_err = f'เชื่อมต่อ Twelve Data ไม่สำเร็จ: {exc}'
+            time.sleep(1.5)
+            continue
+        if r.status_code == 429:
+            last_err = 'Twelve Data rate limit (free plan) — คำขอถี่เกินไป'
+            time.sleep(3.0)
+            continue
+        if r.status_code != 200 or ('code' in data and data.get('code', 200) >= 400):
+            return None, data.get('message', 'Twelve Data API error')
+        return data, None
+    return None, last_err
 
 
-@st.cache_data(ttl=45, show_spinner=False)
-def get_ohlcv(symbol, interval, outputsize=500):
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def _fetch_ohlcv(symbol, interval, outputsize):
     data, err = api_get('time_series', {
         'symbol': symbol, 'interval': interval, 'outputsize': outputsize,
         'apikey': API_KEY, 'timezone': 'UTC'
@@ -49,6 +80,21 @@ def get_ohlcv(symbol, interval, outputsize=500):
     df['datetime'] = pd.to_datetime(df['datetime'], utc=True)
     df = df.sort_values('datetime').set_index('datetime')
     return df.dropna(subset=['open', 'high', 'low', 'close']), None
+
+
+def get_ohlcv(symbol, interval, outputsize=500):
+    """Wraps the cached fetch with a process-level fallback: if the live call
+    fails (rate limit, network hiccup), reuse the last successful pull for
+    this symbol/interval instead of taking the whole app down."""
+    key = (symbol, interval)
+    df, err = _fetch_ohlcv(symbol, interval, outputsize)
+    if err or df.empty:
+        cached = _LAST_GOOD.get(key)
+        if cached is not None and not cached.empty:
+            return cached, f'{err or "ไม่มีข้อมูลใหม่"} (ใช้ข้อมูลล่าสุดที่แคชไว้)'
+        return df, err
+    _LAST_GOOD[key] = df
+    return df, None
 
 
 def indicators(df):
@@ -150,16 +196,14 @@ def macro_context(d1, h4, h1, m15):
     else:
         tactical = 'NEUTRAL'; tactical_strength = int((sH['score'] + s15['score']) / 2)
 
-    relation = 'ALIGNED' if macro == tactical and macro != 'NEUTRAL' else 'PULLBACK' if macro in ('LONG','SHORT') and tactical in ('LONG','SHORT') else 'MIXED'
     return {
         'd1': s1, 'h4': s4, 'h1': sH, 'm15': s15,
         'macro': macro, 'macro_strength': macro_strength,
         'tactical': tactical, 'tactical_strength': tactical_strength,
-        'relation': relation,
     }
 
 
-def _m15_candidate(row, prior, tactical, d):
+def _m15_candidate(row, tactical, d):
     atr = max(float(row.ATR), 1e-9)
     rg = max(float(row.range), 1e-9)
     ema20, ema50 = float(row.EMA20), float(row.EMA50)
@@ -201,7 +245,7 @@ def m15_setup(d, tactical):
     for off in (0,1,2):
         sub=d if off==0 else d.iloc[:-off]
         if len(sub) < 30: continue
-        names=_m15_candidate(sub.iloc[-1], sub.iloc[-2], tactical, sub)
+        names=_m15_candidate(sub.iloc[-1], tactical, sub)
         for n in names:
             candidates.append((off,n))
     if candidates:
@@ -223,8 +267,12 @@ def m5_trigger(d, direction):
     if d is None or len(d) < 50 or direction == 'NEUTRAL':
         return {'ok': False, 'score': 0, 'name': 'รอ M5 trigger', 'type': 'NONE'}
 
-    # Evaluate the last 3 closed candles so a valid trigger is not missed between refreshes.
-    best=None
+    # Evaluate the last 3 closed candles so a valid trigger is not missed between
+    # refreshes. Like m15_setup, prefer the NEWEST candle that clears the ok
+    # threshold (55) rather than whichever of the 3 scores highest — otherwise a
+    # trigger from 1-2 bars ago can keep firing after the latest candle has
+    # already invalidated it.
+    candidates=[]
     for off in (0,1,2):
         sub=d if off==0 else d.iloc[:-off]
         if len(sub) < 25: continue
@@ -243,11 +291,15 @@ def m5_trigger(d, direction):
         else:
             score=min(100, 40*int(bear_break)+35*int(bear_reclaim)+25*int(bear_reject)+10*int(vr>=1.0)+20*int(x.close<x.EMA20))
             name='M5 bearish trigger'
-        if best is None or score>best[0]: best=(score,name,off)
-    if best is None: return {'ok':False,'score':0,'name':'รอ M5 trigger','type':'NONE'}
-    score,name,off=best
-    ok=score>=55
-    return {'ok':ok,'score':int(score),'name':name if ok else ('รอ M5 กลับขึ้น' if direction=='LONG' else 'รอ M5 กลับลง'),'type':direction if ok else 'NONE'}
+        candidates.append((off,score,name))
+    if not candidates:
+        return {'ok':False,'score':0,'name':'รอ M5 trigger','type':'NONE'}
+    qualifying=[c for c in candidates if c[1]>=55]
+    if qualifying:
+        off,score,name=min(qualifying, key=lambda c: c[0])  # newest (smallest off) that qualifies
+        return {'ok':True,'score':int(score),'name':name,'type':direction}
+    off,score,name=max(candidates, key=lambda c: c[1])  # best near-miss, for messaging only
+    return {'ok':False,'score':int(score),'name':'รอ M5 กลับขึ้น' if direction=='LONG' else 'รอ M5 กลับลง','type':'NONE'}
 
 
 def range_location(h4,h1,direction):
@@ -432,44 +484,69 @@ with st.sidebar:
     asset_name = st.selectbox('สินทรัพย์', list(ASSETS.keys()), index=0)
     symbol = ASSETS[asset_name]
     chart_tf = st.selectbox('Timeframe กราฟ', list(TF.keys()), index=1)
-    outputsize = st.slider('จำนวนแท่ง', 250, 800, 500, 50)
+    outputsize = st.slider('จำนวนแท่ง', 250, 800, 400, 50,
+                            help='ค่ายิ่งมาก ยิ่งใช้ credit ต่อคำขอมากขึ้นบนแผนฟรี')
     auto = st.checkbox('Auto refresh', False)
-    refresh = st.slider('รอบรีเฟรช (วินาที)', 30, 300, 60, 10)
+    refresh = st.slider('รอบรีเฟรช (วินาที)', 60, 300, 90, 10,
+                         help=f'ต่ำสุด 60s ให้สอดคล้องกับ cache ({CACHE_TTL}s) และ rate limit ของแผนฟรี')
     if st.button('รีเฟรชข้อมูลตอนนี้'):
         st.cache_data.clear(); st.rerun()
-    st.divider(); st.caption('API: Twelve Data')
+    st.divider()
+    st.caption(f'API: Twelve Data • cache {CACHE_TTL}s • โหลดต่อครั้ง 5 คำขอ (ไม่มีคำขอซ้ำสำหรับกราฟ)')
+    st.caption('ออกแบบให้ประหยัด API credit สำหรับ free-plan key: คำขอถูกหน่วงเวลา, cache ยาวขึ้น, และมี fallback ไปใช้ข้อมูลล่าสุดที่ดึงสำเร็จเมื่อคำขอถูก rate-limit')
 
 if auto:
     st.markdown(f'<meta http-equiv="refresh" content="{refresh}">', unsafe_allow_html=True)
 
-frames, errors = {}, {}
+frames, frames_raw, errors, stale = {}, {}, {}, {}
 for label in ['1D','4h','1h','15m','5m']:
     raw, err = get_ohlcv(symbol, TF[label], outputsize)
     if err:
-        errors[label] = err; frames[label] = pd.DataFrame()
-    else:
-        frames[label] = indicators(closed_only(raw))
+        stale[label] = err if raw is not None and not raw.empty else None
+        errors[label] = err
+    frames_raw[label] = raw if raw is not None else pd.DataFrame()
+    frames[label] = indicators(closed_only(frames_raw[label])) if not frames_raw[label].empty else pd.DataFrame()
 
-chart_raw, chart_err = get_ohlcv(symbol, TF[chart_tf], outputsize)
-chart = indicators(chart_raw) if not chart_raw.empty else pd.DataFrame()
-if chart_err: errors[chart_tf] = chart_err
+# The chart timeframe is always one of the 5 already fetched above (TF keys match
+# chart_tf's options), so it's reused here instead of firing a 6th API call — this
+# also keeps the chart on the same closed-candle data the signals use, so the
+# displayed "Entry" price and the chart/price header never disagree.
+chart_raw = frames_raw.get(chart_tf, pd.DataFrame())
+chart = frames.get(chart_tf, pd.DataFrame())
+
+have_all = all(not frames[l].empty for l in ['1D','4h','1h','15m','5m'])
 if errors:
-    st.error(' | '.join(f'{k}: {v}' for k,v in errors.items())); st.stop()
+    hard = {k: v for k, v in errors.items() if stale.get(k) is None}
+    soft = {k: v for k, v in errors.items() if stale.get(k) is not None}
+    if soft:
+        st.warning('บางไทม์เฟรมใช้ข้อมูลล่าสุดที่แคชไว้ (อาจไม่ใหม่ที่สุด): ' + ' | '.join(f'{k}: {v}' for k, v in soft.items()))
+    if hard:
+        st.error(' | '.join(f'{k}: {v}' for k, v in hard.items()))
+if chart.empty:
+    st.error('ไม่มีข้อมูลสำหรับกราฟ/ราคาปัจจุบัน — อาจถูก rate-limit ลองกด "รีเฟรชข้อมูลตอนนี้" อีกครั้งในอีกสักครู่')
+    st.stop()
 
 price = float(chart.close.iloc[-1]); prev = float(chart.close.iloc[-2]) if len(chart)>1 else price
 pct = (price/prev-1)*100 if prev else 0
 st.subheader(asset_name); st.metric('Price', fmt(price), f'{pct:+.2f}%')
 
-short = evaluate(frames, 'Short Hold'); long = evaluate(frames, 'Long Hold')
 st.markdown('## สถานะการเทรด')
-a,b = st.columns(2)
-with a: render_card(short, 'Short Hold')
-with b: render_card(long, 'Long Hold')
+if have_all:
+    short = evaluate(frames, 'Short Hold'); long = evaluate(frames, 'Long Hold')
+    a,b = st.columns(2)
+    with a: render_card(short, 'Short Hold')
+    with b: render_card(long, 'Long Hold')
+else:
+    st.info('ข้อมูลบางไทม์เฟรมยังไม่พร้อม (rate-limit/ไม่มีข้อมูลแคชสำรอง) — รออีกสักครู่แล้วรีเฟรชใหม่')
 
 st.markdown('## โครงสร้างตลาด')
 rows=[]
 for tf in ['1D','4h','1h','15m','5m']:
-    d=frames[tf]; s=tf_state(d); rg=range_info(d,48)
+    d=frames[tf]
+    if d.empty:
+        rows.append({'TF':tf,'Bias':'—','Trend':'—','Structure':'—','Range':'—','Range High':'—','Range Low':'—'})
+        continue
+    s=tf_state(d); rg=range_info(d,48)
     rows.append({'TF':tf,'Bias':s['bias'],'Trend':s['score'],'Structure':s['structure'],'Range':rg['zone'],'Range High':rg['high'],'Range Low':rg['low']})
 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
