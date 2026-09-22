@@ -1,16 +1,19 @@
-Gold & Bitcoin Trading Analyzer V4.4
-V4.4 rebuilds the signal logic from basic multi-timeframe structure:
-D1 trend -> H4/H1 structure & range -> M15 setup -> M5 entry trigger.
+Gold & Bitcoin Trading Analyzer V4.5
+V4.5 is a full rebuild of the signal engine around a clear hierarchy:
+D1/H4 = Macro direction -> H1/M15 = Tactical direction and setup -> M5 = entry trigger.
 BTC/USD is the default asset and Short Hold + Long Hold are displayed together.
-Modes
-Short Hold: M15 setup + M5 trigger required; tighter structure-based stop.
-Long Hold: D1/H4/H1 structure + M15 setup; M5 helps timing but is not the sole veto.
-Important behavior
-Analysis uses completed candles only.
-WAIT does not display Entry/SL/TP.
-Entry/SL/TP appear only when ENTRY READY.
-Stops are based on recent M5/M15/H1 structure and ATR buffers, not the entire historical range.
-M5 is candle/volume confirmation, not true bid/ask delta, footprint, or DOM.
-Twelve Data REST polling is used; no automatic order placement.
+Signal states
+WAIT: no usable setup yet.
+PRE-ENTRY: direction/setup is developing; wait for the next trigger.
+ENTRY READY: entry conditions are complete and Entry/SL/TP are shown.
+Short Hold
+Follows the tactical H1/M15 direction. It can identify a counter-macro tactical move, but the UI labels the macro/tactical relationship. M15 setup plus M5 trigger are required for ENTRY READY.
+Long Hold
+Follows the D1/H4 macro direction. If H1/M15 move against the macro direction, that is treated as a pullback/rebound rather than an automatic long/short signal. M15 setup is required; M5 helps timing.
+M15 setups
+Pullback, breakout/breakdown, sweep/reclaim/reject, and continuation.
+Risk
+Stops use recent structure plus ATR buffers. Entry/SL/TP are shown only for ENTRY READY. The analysis uses completed candles only.
+M5 is candle/relative-volume confirmation, not true bid/ask delta, footprint, or DOM. Twelve Data REST polling is used; there is no automatic order placement.
 Streamlit Secrets
 TWELVEDATA_API_KEY = "YOUR_KEY"
