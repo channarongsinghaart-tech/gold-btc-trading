@@ -1,17 +1,15 @@
 import os
-import time
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 import plotly.graph_objects as go
 
-st.set_page_config(page_title='Gold & BTC Trading Analyzer V4.2.2', page_icon='📈', layout='wide')
+st.set_page_config(page_title='Gold & Bitcoin Trading Analyzer V4.3', page_icon='📈', layout='wide')
 
 BASE = 'https://api.twelvedata.com'
-ASSETS = {'Bitcoin BTC/USD': 'BTC/USD', 'Gold XAU/USD': 'XAU/USD'}
+ASSETS = {'Bitcoin BTC/USD':'BTC/USD','Gold XAU/USD':'XAU/USD'}
 TF = {'5m':'5min','15m':'15min','30m':'30min','1h':'1h','4h':'4h','1D':'1day'}
-ANALYSIS_TFS = ['1D','4h','1h','30m']
 
 API_KEY = os.getenv('TWELVEDATA_API_KEY','')
 try:
@@ -25,58 +23,53 @@ def api_get(endpoint, params):
     if not API_KEY:
         return None, 'ยังไม่ได้ตั้ง TWELVEDATA_API_KEY'
     try:
-        r = requests.get(f'{BASE}/{endpoint}', params=params, timeout=20)
-        data = r.json()
+        r=requests.get(f'{BASE}/{endpoint}',params=params,timeout=20)
+        data=r.json()
     except Exception as exc:
         return None, f'เชื่อมต่อ Twelve Data ไม่สำเร็จ: {exc}'
-    if r.status_code != 200 or ('code' in data and data.get('code', 200) >= 400):
+    if r.status_code != 200 or ('code' in data and data.get('code',200) >= 400):
         return None, data.get('message','Twelve Data API error')
-    return data, None
+    return data,None
 
 
 @st.cache_data(ttl=45, show_spinner=False)
 def get_ohlcv(symbol, interval, outputsize=500):
-    data, err = api_get('time_series', {
-        'symbol': symbol, 'interval': interval, 'outputsize': outputsize,
-        'apikey': API_KEY, 'timezone': 'UTC'
+    data,err=api_get('time_series',{
+        'symbol':symbol,'interval':interval,'outputsize':outputsize,
+        'apikey':API_KEY,'timezone':'UTC'
     })
-    if err:
-        return pd.DataFrame(), err
+    if err: return pd.DataFrame(),err
     if not data or 'values' not in data:
-        return pd.DataFrame(), (data or {}).get('message','ไม่มีข้อมูล')
-    df = pd.DataFrame(data['values'])
+        return pd.DataFrame(),(data or {}).get('message','ไม่มีข้อมูล')
+    df=pd.DataFrame(data['values'])
     for c in ['open','high','low','close','volume']:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
-    df['datetime'] = pd.to_datetime(df['datetime'], utc=True)
-    df = df.sort_values('datetime').set_index('datetime')
-    return df.dropna(subset=['open','high','low','close']), None
+        if c in df.columns: df[c]=pd.to_numeric(df[c],errors='coerce')
+    df['datetime']=pd.to_datetime(df['datetime'],utc=True)
+    df=df.sort_values('datetime').set_index('datetime')
+    return df.dropna(subset=['open','high','low','close']),None
 
 
-def add_indicators(df):
+def indicators(df):
     d=df.copy(); c,h,l=d.close,d.high,d.low
     for n in (20,50,200): d[f'EMA{n}']=c.ewm(span=n,adjust=False).mean()
+    tr=pd.concat([(h-l),(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
+    d['ATR']=tr.ewm(alpha=1/14,adjust=False).mean()
     delta=c.diff(); gain=delta.clip(lower=0).ewm(alpha=1/14,adjust=False).mean(); loss=(-delta.clip(upper=0)).ewm(alpha=1/14,adjust=False).mean()
     rs=gain/loss.replace(0,np.nan); d['RSI']=100-(100/(1+rs))
-    e12=c.ewm(span=12,adjust=False).mean(); e26=c.ewm(span=26,adjust=False).mean()
-    d['MACD']=e12-e26; d['MACDsig']=d.MACD.ewm(span=9,adjust=False).mean(); d['MACDhist']=d.MACD-d.MACDsig
-    tr=pd.concat([(h-l),(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
-    d['ATR']=tr.ewm(alpha=1/14,adjust=False).mean(); d['ATR_pct']=d.ATR/d.close*100
+    d['range']=h-l; d['body']=(c-d.open).abs(); d['body_ratio']=d.body/d['range'].replace(0,np.nan)
+    d['upper_wick']=h-d[['open','close']].max(axis=1)
+    d['lower_wick']=d[['open','close']].min(axis=1)-l
     if 'volume' in d.columns:
         d['VolMA20']=d.volume.rolling(20).mean(); d['VolRatio']=d.volume/d.VolMA20
     else: d['VolMA20']=np.nan; d['VolRatio']=np.nan
-    d['body']=(d.close-d.open).abs(); d['range']=d.high-d.low
-    d['body_ratio']=d.body/d.range.replace(0,np.nan)
-    d['upper_wick']=d.high-d[['open','close']].max(axis=1)
-    d['lower_wick']=d[['open','close']].min(axis=1)-d.low
-    d['EMA20_slope']=d.EMA20.diff(5)
     return d
 
 
-def structure_state(d, lookback=20):
-    if len(d)<lookback+6: return 'MIXED'
-    mid=max(4,lookback//3); recent=d.iloc[-mid:]; prior=d.iloc[-lookback:-mid]
-    rh,rl=float(recent.high.max()),float(recent.low.min()); ph,pl=float(prior.high.max()),float(prior.low.min())
+def structure(d, n=20):
+    if len(d)<n+6: return 'MIXED'
+    recent=d.iloc[-6:]; prior=d.iloc[-n:-6]
+    rh,rl=float(recent.high.max()),float(recent.low.min())
+    ph,pl=float(prior.high.max()),float(prior.low.min())
     if rh>ph and rl>pl: return 'HH_HL'
     if rh<ph and rl<pl: return 'LH_LL'
     x=d.iloc[-1]
@@ -85,624 +78,203 @@ def structure_state(d, lookback=20):
     return 'MIXED'
 
 
-def bias(d):
-    if d is None or len(d)<220: return 'NEUTRAL',50,'ข้อมูลไม่พอ'
-    x=d.iloc[-1]; state=structure_state(d); bull=0; bear=0
-    bull += int(x.close>x.EMA20); bear += int(x.close<x.EMA20)
-    bull += int(x.EMA20>x.EMA50); bear += int(x.EMA20<x.EMA50)
-    bull += int(x.EMA50>x.EMA200); bear += int(x.EMA50<x.EMA200)
-    bull += int(x.MACD>x.MACDsig); bear += int(x.MACD<x.MACDsig)
-    if state in ('HH_HL','BULL'): bull+=2
-    elif state in ('LH_LL','BEAR'): bear+=2
-    if bull>bear: return 'LONG',int(np.clip(50+(bull-bear)*12.5,0,100)),state
-    if bear>bull: return 'SHORT',int(np.clip(50+(bear-bull)*12.5,0,100)),state
-    return 'NEUTRAL',50,state
+def trend_score(d):
+    if d is None or len(d)<205: return 'NEUTRAL',50,{'structure':'MIXED','ema':0,'price':0,'slope':0}
+    x=d.iloc[-1]; atr=max(float(x.ATR),1e-9); st=structure(d)
+    bull=bear=0
+    bull += 1 if x.EMA20>x.EMA50 else 0; bear += 1 if x.EMA20<x.EMA50 else 0
+    bull += 1 if x.EMA50>x.EMA200 else 0; bear += 1 if x.EMA50<x.EMA200 else 0
+    bull += 1 if x.close>x.EMA20 else 0; bear += 1 if x.close<x.EMA20 else 0
+    slope=x.EMA20-d.EMA20.iloc[-6]
+    bull += 1 if slope>0 else 0; bear += 1 if slope<0 else 0
+    bull += 2 if st in ('HH_HL','BULL') else 0; bear += 2 if st in ('LH_LL','BEAR') else 0
+    diff=bull-bear
+    if diff>0: bias='LONG'
+    elif diff<0: bias='SHORT'
+    else: bias='NEUTRAL'
+    score=int(np.clip(50+abs(diff)*10,0,100))
+    return bias,score,{'structure':st,'ema':bull-bear,'price':1 if x.close>x.EMA20 else -1,'slope':float(slope/atr)}
 
 
-def levels(d, lookback=150):
-    x=d.tail(lookback); ph=x.high.rolling(5,center=True).max(); pl=x.low.rolling(5,center=True).min()
-    r=x.loc[x.high>=ph,'high'].dropna().tail(12); s=x.loc[x.low<=pl,'low'].dropna().tail(12)
-    resistance=float(r.mean()) if len(r) else float(x.high.tail(30).max())
-    support=float(s.mean()) if len(s) else float(x.low.tail(30).min())
-    return support,resistance
-
-
-def setup_flags(d):
-    if len(d)<30: return {}
-    x=d.iloc[-1]; prior=d.iloc[-21:-1]; atr=float(x.ATR)
-    if not np.isfinite(atr) or atr<=0: return {}
-    ph=float(prior.high.max()); pl=float(prior.low.min())
-    bull_break=bool(x.close>ph and x.close>x.open and x.body_ratio>=.50 and x.body>=.35*atr)
-    bear_break=bool(x.close<pl and x.close<x.open and x.body_ratio>=.50 and x.body>=.35*atr)
-    bull_pull=bool(x.close>x.EMA20 and x.EMA20>x.EMA50 and x.low<=x.EMA20+.15*atr and x.close>x.open and x.body_ratio>=.35)
-    bear_pull=bool(x.close<x.EMA20 and x.EMA20<x.EMA50 and x.high>=x.EMA20-.15*atr and x.close<x.open and x.body_ratio>=.35)
-    recent_low=float(d.iloc[-8:-1].low.min()); recent_high=float(d.iloc[-8:-1].high.max())
-    bull_sweep=bool(x.low<recent_low and x.close>recent_low and x.close>x.open)
-    bear_sweep=bool(x.high>recent_high and x.close<recent_high and x.close<x.open)
-    return {'bull_breakout':bull_break,'bear_breakdown':bear_break,'bull_pullback':bull_pull,'bear_pullback':bear_pull,'bull_sweep':bull_sweep,'bear_sweep':bear_sweep}
-
-
-def fib_location(d, lookback=80):
-    x=d.tail(lookback)
-    hi=float(x.high.max()); lo=float(x.low.min()); span=hi-lo
-    if span<=0: return {'high':hi,'low':lo,'zone_low':np.nan,'zone_high':np.nan,'price_pos':np.nan,'label':'N/A'}
-    # For a bullish swing, discount is measured down from high; for bearish, premium is measured up from low.
-    z705=hi-.705*span; z788=hi-.788*span; z886=hi-.886*span
-    price=float(d.close.iloc[-1])
+def range_info(d,n=48):
+    x=d.tail(n)
+    hi=float(x.high.max()); lo=float(x.low.min()); span=max(hi-lo,1e-9); price=float(d.close.iloc[-1])
     pos=(price-lo)/span
-    if z886 <= price <= z705: label='Bullish deep-discount zone'
-    elif z705 < price <= hi: label='Premium / not ideal for long'
-    elif lo <= price < z886: label='Below 0.886 — long invalidation zone'
-    else: label='Neutral location'
-    return {'high':hi,'low':lo,'z705':z705,'z788':z788,'z886':z886,'price_pos':pos,'label':label}
+    if pos<0.20: zone='LOWER RANGE'
+    elif pos>0.80: zone='UPPER RANGE'
+    else: zone='MID RANGE'
+    return {'high':hi,'low':lo,'span':span,'pos':pos,'zone':zone}
 
 
-def volume_profile_proxy(d, lookback=120, bins=32):
-    x=d.tail(lookback).copy()
-    if x.empty: return {}
-    lo=float(x.low.min()); hi=float(x.high.max()); span=hi-lo
-    if span<=0: return {}
-    typical=(x.high+x.low+x.close)/3
-    vol=x.volume if 'volume' in x.columns else pd.Series(np.ones(len(x)),index=x.index)
-    vol=pd.to_numeric(vol,errors='coerce').fillna(0)
-    idx=np.clip(((typical-lo)/span*bins).astype(int),0,bins-1)
-    profile=np.zeros(bins)
-    for i,v in zip(idx,vol): profile[int(i)]+=float(v)
-    if profile.max()<=0: return {}
-    poc_idx=int(np.argmax(profile)); poc=lo+(poc_idx+.5)*span/bins
-    # approximate value area = bins accumulating around POC until ~70% volume
-    order=[poc_idx]; used=profile[poc_idx]; target=.70*profile.sum(); left=poc_idx-1; right=poc_idx+1
-    while used<target and (left>=0 or right<bins):
-        lv=profile[left] if left>=0 else -1; rv=profile[right] if right<bins else -1
-        if rv>=lv: order.append(right); used+=max(rv,0); right+=1
-        else: order.append(left); used+=max(lv,0); left-=1
-    va_low=lo+(min(order)+.0)*span/bins; va_high=lo+(max(order)+1.0)*span/bins
-    price=float(d.close.iloc[-1])
-    if price<va_low: loc='Below value / discount'
-    elif price>va_high: loc='Above value / premium'
-    else: loc='Inside value'
-    return {'poc':poc,'va_low':va_low,'va_high':va_high,'location':loc,'volume_total':float(vol.sum())}
-
-
-def session_label(ts):
-    h=ts.hour
-    if 0<=h<7: return 'Asia'
-    if 7<=h<12: return 'London'
-    if 12<=h<17: return 'New York'
-    return 'Late / overlap'
-
-
-def proxy_orderflow(d):
-    """Candle/volume proxy only. It is not true bid/ask delta or footprint data."""
-    if d is None or len(d)<25: return {'score':50,'state':'NO DATA','reasons':[],'participation':np.nan}
-    x=d.iloc[-1]; p=d.iloc[-2]; pp=d.iloc[-3]
-    atr=float(x.ATR) if np.isfinite(x.ATR) else np.nan
-    vr=float(x.VolRatio) if np.isfinite(x.VolRatio) else np.nan
-    participation=vr
-    score=50; reasons=[]
-    rng=max(float(x.range),1e-12); body=float(x.body); upper=float(x.upper_wick); lower=float(x.lower_wick)
-    high_part=np.isfinite(vr) and vr>=1.15
-    low_part=np.isfinite(vr) and vr<0.75
-    if high_part: reasons.append(f'participation {vr:.1f}x')
-    if low_part: reasons.append(f'low participation {vr:.1f}x')
-
-    bull_abs=(lower>=0.45*rng and x.close>x.open and high_part and (x.close-float(x.low))>=0.65*rng)
-    bear_abs=(upper>=0.45*rng and x.close<x.open and high_part and (float(x.high)-x.close)>=0.65*rng)
-    bull_flip=(p.close<p.open and x.close>x.open and x.close>p.high and body>=0.35*rng)
-    bear_flip=(p.close>p.open and x.close<x.open and x.close<p.low and body>=0.35*rng)
-    bull_progress=(x.close>p.close>pp.close)
-    bear_progress=(x.close<p.close<pp.close)
-    if bull_abs: score+=18; reasons.append('bullish absorption proxy')
-    if bear_abs: score-=18; reasons.append('bearish absorption proxy')
-    if bull_flip: score+=18; reasons.append('bullish dominance-shift proxy')
-    if bear_flip: score-=18; reasons.append('bearish dominance-shift proxy')
-    if bull_progress: score+=8
-    if bear_progress: score-=8
-    if low_part: score=50+(score-50)*0.55
-    score=int(np.clip(round(score),0,100))
-    if score>=68: state='BULLISH'
-    elif score<=32: state='BEARISH'
-    else: state='NEUTRAL'
-    return {'score':score,'state':state,'reasons':reasons,'participation':participation,'bull_abs':bull_abs,'bear_abs':bear_abs,'bull_flip':bull_flip,'bear_flip':bear_flip}
-
-
-def environment(d):
-    if d is None or len(d)<80: return 'UNKNOWN',50,'ข้อมูลไม่พอ'
-    x=d.iloc[-1]; atr_med=float(d.ATR.tail(50).median()); atr=float(x.ATR)
-    slope=float(x.EMA20_slope); price=float(x.close)
-    trend_strength=abs(float(x.EMA20-x.EMA50))/max(atr,1e-9)
-    state=structure_state(d)
-    compression=atr_med>0 and atr<0.75*atr_med
-    expansion=atr_med>0 and atr>1.25*atr_med
-    if compression: return 'COMPRESSION',int(np.clip(55+trend_strength*8,0,100)), 'ATR compressed vs 50-bar median'
-    if state in ('HH_HL','BULL') and slope>0 and trend_strength>=0.35:
-        return 'INITIATIVE UP',int(np.clip(60+trend_strength*12+(10 if expansion else 0),0,100)),'bullish structure + EMA slope'
-    if state in ('LH_LL','BEAR') and slope<0 and trend_strength>=0.35:
-        return 'INITIATIVE DOWN',int(np.clip(60+trend_strength*12+(10 if expansion else 0),0,100)),'bearish structure + EMA slope'
-    return 'BALANCE',int(np.clip(55+trend_strength*8,0,100)),'mixed/rotational structure'
-
-
-def v42_engine(frames, mode, flow):
-    """Two trading horizons, both M30-primary.
-
-    Short Hold: tighter M30 setup + stronger M5 proxy confirmation.
-    Long Hold: wider M30 setup with H1/H4 regime; M5 is confirmatory, not mandatory.
-    """
-    details={}
-    for tf in ANALYSIS_TFS:
-        d=frames.get(tf)
-        if d is not None and not d.empty:
-            b,s,r=bias(d); env,envs,envr=environment(d)
-            details[tf]={'Bias':b,'Strength':s,'Structure':structure_state(d),'Environment':env,'EnvScore':envs,'Reason':r}
-    if any(tf not in details for tf in ANALYSIS_TFS):
-        return 'NO TRADE',0,0,details,'MTF data incomplete'
-
-    dirs={tf:details[tf]['Bias'] for tf in ANALYSIS_TFS}
-    d1,h4,h1,m30=[dirs[x] for x in ANALYSIS_TFS]
-    flow_dir='LONG' if flow['score']>=68 else 'SHORT' if flow['score']<=32 else 'NEUTRAL'
-
-    # Score uses D1/H4/H1/M30, while entry horizon determines how much confirmation is required.
-    weights={'1D':25,'4h':30,'1h':25,'30m':20}
-    dominant = d1 if d1 in ('LONG','SHORT') else h4 if h4 in ('LONG','SHORT') else 'NO TRADE'
-    if dominant=='NO TRADE':
-        return 'NO TRADE',0,0,details,'No dominant higher-timeframe direction'
-
-    aligned=sum(details[t]['Bias']==dominant for t in ANALYSIS_TFS)
-    opposing=sum(details[t]['Bias'] not in (dominant,'NEUTRAL') for t in ANALYSIS_TFS)
-    weighted=sum(weights[t]*details[t]['Strength']/100 for t in ANALYSIS_TFS if details[t]['Bias']==dominant)
-    trend_score=int(np.clip(round(weighted/sum(weights.values())*100),0,100))
-    align=int(round(100*sum(weights[t] for t in ANALYSIS_TFS if details[t]['Bias']==dominant)/sum(weights.values())))
-
-    if mode=='1 — Short Hold':
-        # Narrow signal: H4/H1/M30 must agree; D1 may be neutral but must not directly oppose.
-        if h4!=dominant or h1!=dominant or m30!=dominant:
-            return 'NO TRADE',trend_score,align,details,'Short Hold: H4/H1/M30 not fully aligned'
-        if d1 not in (dominant,'NEUTRAL'):
-            return 'NO TRADE',trend_score,align,details,'Short Hold: D1 conflicts'
-        if trend_score<62:
-            return 'NO TRADE',trend_score,align,details,'Short Hold: trend strength too weak'
-        # M5 confirmation is mandatory and stronger than the old V4.2 gate.
-        if flow_dir!=dominant or abs(flow['score']-50)<22:
-            return 'NO TRADE',trend_score,align,details,'Short Hold: M5 confirmation not strong enough'
-        final_score=int(np.clip(round(.62*trend_score+.18*align+.20*flow['score']),0,100))
-        signal='SHORT HOLD LONG' if dominant=='LONG' else 'SHORT HOLD SHORT'
-        return signal,final_score,align,details,'Short Hold: M30 setup + strong M5 confirmation'
-
-    # Long Hold: D1/H4 define the regime. H1 or M30 can provide the setup confirmation.
-    if h4!=dominant:
-        return 'NO TRADE',trend_score,align,details,'Long Hold: H4 does not confirm regime'
-    confirmations=sum(x==dominant for x in (h1,m30))
-    if confirmations<1 or opposing>=2:
-        return 'NO TRADE',trend_score,align,details,'Long Hold: insufficient H1/M30 confirmation'
-    if trend_score<52:
-        return 'NO TRADE',trend_score,align,details,'Long Hold: higher-timeframe trend too weak'
-    final_score=int(np.clip(round(.70*trend_score+.20*align+.10*flow['score']),0,100))
-    # M5 can weaken, but does not veto a longer-horizon setup.
-    if flow_dir not in (dominant,'NEUTRAL'):
-        final_score=max(0,final_score-8)
-        note='M5 proxy opposes; long-hold setup remains valid only if M30 entry passes'
+def entry_patterns(d, direction):
+    if d is None or len(d)<60: return {'setup':False,'name':'ข้อมูลไม่พอ','score':0,'reasons':[]}
+    x=d.iloc[-1]; p=d.iloc[-2]; atr=max(float(x.ATR),1e-9); rg=max(float(x.range),1e-9)
+    recent_hi=float(d.iloc[-21:-1].high.max()); recent_lo=float(d.iloc[-21:-1].low.min())
+    bull_break=x.close>recent_hi and x.close>x.open and x.body_ratio>=0.45 and x.body>=0.25*atr
+    bear_break=x.close<recent_lo and x.close<x.open and x.body_ratio>=0.45 and x.body>=0.25*atr
+    bull_pull=x.close>x.EMA20 and x.EMA20>=x.EMA50 and x.low<=x.EMA20+0.25*atr and x.close>x.open
+    bear_pull=x.close<x.EMA20 and x.EMA20<=x.EMA50 and x.high>=x.EMA20-0.25*atr and x.close<x.open
+    bull_sweep=x.low<float(d.iloc[-8:-1].low.min()) and x.close>float(d.iloc[-8:-1].low.min()) and x.close>x.open
+    bear_sweep=x.high>float(d.iloc[-8:-1].high.max()) and x.close<float(d.iloc[-8:-1].high.max()) and x.close<x.open
+    names=[]
+    if direction=='LONG':
+        if bull_pull: names.append('M15 pullback')
+        if bull_break: names.append('M15 breakout')
+        if bull_sweep: names.append('M15 sweep-reclaim')
     else:
-        note='M5 proxy supportive/neutral'
-    signal='LONG HOLD LONG' if dominant=='LONG' else 'LONG HOLD SHORT'
-    return signal,final_score,align,details,f'Long Hold: H1/M30 regime confirmation; {note}'
+        if bear_pull: names.append('M15 pullback')
+        if bear_break: names.append('M15 breakdown')
+        if bear_sweep: names.append('M15 sweep-reject')
+    return {'setup':bool(names),'name':' + '.join(names) if names else 'รอ M15 setup','score':min(100,35+25*len(names)),'reasons':names}
 
 
-def entry_plan(frames, direction, support, resistance, mode, flow, loc, vp):
-    if direction=='NO TRADE': return None,'No directional signal'
-    base='LONG' if 'LONG' in direction else 'SHORT'
-    m30=frames.get('30m'); h1=frames.get('1h'); h4=frames.get('4h')
-    if any(x is None or x.empty for x in (m30,h1,h4)): return None,'MTF entry data incomplete'
-    x=m30.iloc[-1]; atr=float(x.ATR); price=float(x.close)
-    if not np.isfinite(atr) or atr<=0: return None,'ATR invalid'
-    flags=setup_flags(m30)
-    if base=='LONG':
-        setup=flags.get('bull_pullback') or flags.get('bull_breakout') or flags.get('bull_sweep')
-        if mode=='1 — Short Hold':
-            near_ema=np.isfinite(x.EMA20) and abs(price-float(x.EMA20))<=.35*atr and price>float(x.EMA50)
-            flow_ok=flow['score']>=72
-            location_ok=(vp and vp.get('location') in ('Below value / discount','Inside value')) or loc.get('label','').startswith('Bullish deep')
-            if not (setup or near_ema): return None,'Short Hold: รอ M30 pullback/breakout/sweep หรือ EMA20 ใกล้ ๆ'
-            if not flow_ok: return None,'Short Hold: M5 confirmation ยังไม่แรงพอ'
-            if not location_ok and not setup: return None,'Short Hold: location ยังไม่เหมาะ'
-            if np.isfinite(resistance) and resistance>price and resistance-price<.80*atr: return None,'Short Hold: ใกล้ resistance เกินไป'
-            invalidation=float(min(h1.tail(20).low.min(),h4.tail(12).low.min(),m30.tail(8).low.min()))
-            sl=invalidation-.15*atr; risk=price-sl
-            max_risk=2.0
-            rr1,rr2=1.25,2.0
-        else:
-            near_ema=np.isfinite(x.EMA20) and abs(price-float(x.EMA20))<=.85*atr and price>float(x.EMA50)
-            location_ok=(vp and vp.get('location') in ('Below value / discount','Inside value')) or loc.get('label','').startswith('Bullish deep')
-            if not (setup or near_ema): return None,'Long Hold: รอ M30 pullback/breakout/sweep หรือ EMA20 proximity'
-            if not location_ok and not setup: return None,'Long Hold: location ยังไม่เหมาะ'
-            if np.isfinite(resistance) and resistance>price and resistance-price<.20*atr: return None,'Long Hold: ใกล้ resistance เกินไป'
-            invalidation=float(min(h1.tail(40).low.min(),h4.tail(30).low.min(),m30.tail(16).low.min()))
-            sl=invalidation-.30*atr; risk=price-sl
-            max_risk=4.0
-            rr1,rr2=1.5,3.0
-        if risk<=0 or risk>max_risk*atr: return None,'Risk distance too large'
-        tp1=price+rr1*risk; tp2=price+rr2*risk
-        return {'direction':'LONG','entry':price,'sl':sl,'tp1':tp1,'tp2':tp2,'risk':risk,'rr1':rr1,'rr2':rr2,'invalidation':invalidation,'setup':'Pullback/Breakout/Sweep' if setup else 'EMA20 proximity','flow_score':flow['score'],'location':vp.get('location','') if vp else loc.get('label','')},'READY'
-
-    setup=flags.get('bear_pullback') or flags.get('bear_breakdown') or flags.get('bear_sweep')
-    if mode=='1 — Short Hold':
-        near_ema=np.isfinite(x.EMA20) and abs(price-float(x.EMA20))<=.35*atr and price<float(x.EMA50)
-        flow_ok=flow['score']<=28
-        location_ok=(vp and vp.get('location') in ('Above value / premium','Inside value')) or loc.get('label','').startswith('Premium')
-        if not (setup or near_ema): return None,'Short Hold: รอ M30 pullback/breakdown/sweep หรือ EMA20 ใกล้ ๆ'
-        if not flow_ok: return None,'Short Hold: M5 confirmation ยังไม่แรงพอ'
-        if not location_ok and not setup: return None,'Short Hold: location ยังไม่เหมาะ'
-        if np.isfinite(support) and price>support and price-support<.80*atr: return None,'Short Hold: ใกล้ support เกินไป'
-        invalidation=float(max(h1.tail(20).high.max(),h4.tail(12).high.max(),m30.tail(8).high.max()))
-        sl=invalidation+.15*atr; risk=sl-price
-        max_risk=2.0
-        rr1,rr2=1.25,2.0
+def m5_trigger(d,direction):
+    if d is None or len(d)<30: return {'ok':False,'score':50,'name':'M5 data unavailable'}
+    x=d.iloc[-1]; p=d.iloc[-2]; atr=max(float(x.ATR),1e-9); rg=max(float(x.range),1e-9)
+    bull=(x.close>x.open and x.close>p.high and x.body_ratio>=0.35) or (x.close>x.open and x.lower_wick>=0.35*rg and x.close>=x.low+0.65*rg)
+    bear=(x.close<x.open and x.close<p.low and x.body_ratio>=0.35) or (x.close<x.open and x.upper_wick>=0.35*rg and x.close<=x.high-0.65*rg)
+    vr=float(x.VolRatio) if np.isfinite(x.VolRatio) else 1.0
+    score=50
+    if direction=='LONG':
+        if bull: score+=30
+        if x.close>x.EMA20: score+=10
+        if vr>=1.1: score+=10
+        ok=score>=70
+        name='M5 bullish trigger' if ok else 'รอ M5 ยืนยัน Long'
     else:
-        near_ema=np.isfinite(x.EMA20) and abs(price-float(x.EMA20))<=.85*atr and price<float(x.EMA50)
-        location_ok=(vp and vp.get('location') in ('Above value / premium','Inside value')) or loc.get('label','').startswith('Premium')
-        if not (setup or near_ema): return None,'Long Hold: รอ M30 pullback/breakdown/sweep หรือ EMA20 proximity'
-        if not location_ok and not setup: return None,'Long Hold: location ยังไม่เหมาะ'
-        if np.isfinite(support) and price>support and price-support<.20*atr: return None,'Long Hold: ใกล้ support เกินไป'
-        invalidation=float(max(h1.tail(40).high.max(),h4.tail(30).high.max(),m30.tail(16).high.max()))
-        sl=invalidation+.30*atr; risk=sl-price
-        max_risk=4.0
-        rr1,rr2=1.5,3.0
-    if risk<=0 or risk>max_risk*atr: return None,'Risk distance too large'
-    tp1=price-rr1*risk; tp2=price-rr2*risk
-    return {'direction':'SHORT','entry':price,'sl':sl,'tp1':tp1,'tp2':tp2,'risk':risk,'rr1':rr1,'rr2':rr2,'invalidation':invalidation,'setup':'Pullback/Breakdown/Sweep' if setup else 'EMA20 proximity','flow_score':flow['score'],'location':vp.get('location','') if vp else loc.get('label','')},'READY'
+        if bear: score+=30
+        if x.close<x.EMA20: score+=10
+        if vr>=1.1: score+=10
+        ok=score>=70
+        name='M5 bearish trigger' if ok else 'รอ M5 ยืนยัน Short'
+    return {'ok':ok,'score':int(np.clip(score,0,100)),'name':name}
 
 
-
-
-
-def regime_compatible(mode, frames, base):
-    """Simple regime-aware quality check; it does not override the engine gate."""
-    h4=frames.get('4h')
-    h1=frames.get('1h')
-    if h4 is None or h1 is None or h4.empty or h1.empty:
-        return False
-    e4=environment(h4)[0]; e1=environment(h1)[0]
-    if base=='LONG':
-        return e4 in ('INITIATIVE UP','BALANCE','COMPRESSION') and e1 in ('INITIATIVE UP','BALANCE','COMPRESSION')
-    return e4 in ('INITIATIVE DOWN','BALANCE','COMPRESSION') and e1 in ('INITIATIVE DOWN','BALANCE','COMPRESSION')
-
-def entry_quality(frames, direction, mode, flow, loc, vp, risk, vscore, alignment, details=None):
-    """Separate setup quality from trend score. Returns 0-100 plus component breakdown.
-    When there is NO TRADE, estimate readiness from the dominant higher-timeframe
-    direction so the UI still shows why the setup is not ready.
-    """
-    details = details or {}
-    if direction == 'NO TRADE':
-        base = 'LONG' if details.get('1D',{}).get('Bias') == 'LONG' or (details.get('1D',{}).get('Bias') == 'NEUTRAL' and details.get('4h',{}).get('Bias') == 'LONG') else 'SHORT'
-        if details.get('1D',{}).get('Bias') == 'SHORT' or (details.get('1D',{}).get('Bias') == 'NEUTRAL' and details.get('4h',{}).get('Bias') == 'SHORT'):
-            base='SHORT'
+def make_plan(m15,direction,h1,h4,mode):
+    x=m15.iloc[-1]; atr=max(float(x.ATR),1e-9); price=float(x.close)
+    r=range_info(m15,48)
+    if direction=='LONG':
+        structure_low=min(float(m15.tail(12).low.min()),float(h1.tail(12).low.min()),float(h4.tail(12).low.min()))
+        sl=min(structure_low,price-1.2*atr)
+        if sl>=price: sl=price-1.2*atr
+        risk=price-sl; tp1=price+(1.25 if mode=='Short Hold' else 1.5)*risk; tp2=price+(2.0 if mode=='Short Hold' else 3.0)*risk
     else:
-        base='LONG' if 'LONG' in direction else 'SHORT'
-    m30=frames.get('30m')
-    if m30 is None or m30.empty:
-        return 0, {}
-    x=m30.iloc[-1]; atr=float(x.ATR); price=float(x.close)
-    flags=setup_flags(m30)
-    setup_keys=('bull_pullback','bull_breakout','bull_sweep') if base=='LONG' else ('bear_pullback','bear_breakdown','bear_sweep')
-    setup_score=100 if any(flags.get(k,False) for k in setup_keys) else 55
-    if np.isfinite(atr) and atr>0:
-        ema_dist=abs(price-float(x.EMA20))/atr if np.isfinite(x.EMA20) else 9
-        if mode=='1 — Short Hold': ema_score=int(np.clip(100-ema_dist*180,0,100))
-        else: ema_score=int(np.clip(100-ema_dist*90,0,100))
-    else: ema_score=0
-    fs=int(flow.get('score',50))
-    confirm=100-int(np.clip(abs(fs-(78 if base=='LONG' else 22))*2.0,0,100))
-    if mode=='1 — Short Hold':
-        confirm=int(np.clip(100-abs(fs-(82 if base=='LONG' else 18))*2.2,0,100))
-    loc_text=((risk or {}).get('location') or '')
-    location=100 if (('discount' in loc_text.lower() or 'inside value' in loc_text.lower()) if base=='LONG' else ('premium' in loc_text.lower() or 'inside value' in loc_text.lower())) else 55
-    if risk:
-        rr=min(float(risk.get('rr2',0))/3.0*100,100)
-    else:
-        # Provisional R:R readiness: use the configured horizon's typical target multiple.
-        rr_target = 2.0 if mode=='1 — Short Hold' else 3.0
-        rr=min(rr_target/3.0*100,100)
-    score=int(np.clip(round(.25*vscore+.15*alignment+.20*setup_score+.15*confirm+.10*location+.15*rr),0,100))
-    return score, {'Trend':int(vscore),'Alignment':int(alignment),'Setup':int(setup_score),'Confirmation':int(confirm),'Location':int(location),'R:R':int(round(rr))}
+        structure_high=max(float(m15.tail(12).high.max()),float(h1.tail(12).high.max()),float(h4.tail(12).high.max()))
+        sl=max(structure_high,price+1.2*atr)
+        if sl<=price: sl=price+1.2*atr
+        risk=sl-price; tp1=price-(1.25 if mode=='Short Hold' else 1.5)*risk; tp2=price-(2.0 if mode=='Short Hold' else 3.0)*risk
+    return {'entry':price,'sl':float(sl),'tp1':float(tp1),'tp2':float(tp2),'risk':float(risk),'range_zone':r['zone']}
 
 
-def init_journal():
-    if 'trade_journal' not in st.session_state:
-        st.session_state.trade_journal=[]
-    if 'active_trade_ids' not in st.session_state:
-        st.session_state.active_trade_ids={}
+def evaluate(frames,mode):
+    d1,h4,h1,m15,m5=[frames[k] for k in ['1D','4h','1h','15m','5m']]
+    b1,s1,i1=trend_score(d1); b4,s4,i4=trend_score(h4); bH,sH,iH=trend_score(h1)
+    direction='LONG' if (b1=='LONG' and (b4=='LONG' or bH=='LONG')) else 'SHORT' if (b1=='SHORT' and (b4=='SHORT' or bH=='SHORT')) else 'NEUTRAL'
+    if direction=='NEUTRAL':
+        if b4=='LONG' and bH=='LONG': direction='LONG'
+        elif b4=='SHORT' and bH=='SHORT': direction='SHORT'
+    align=int(np.mean([s1,s4,sH]))
+    m15range=range_info(m15,48); setup=entry_patterns(m15,direction if direction!='NEUTRAL' else 'LONG') if direction!='NEUTRAL' else {'setup':False,'name':'D1/H4/H1 ยังไม่ชัด','score':25,'reasons':[]}
+    trigger=m5_trigger(m5,direction) if direction!='NEUTRAL' else {'ok':False,'score':50,'name':'รอ Direction'}
+    # Location score: prefer lower half for longs and upper half for shorts; avoid middle.
+    loc_pos=m15range['pos']
+    if direction=='LONG': loc=int(np.clip(100-abs(loc_pos-0.30)*120,0,100))
+    elif direction=='SHORT': loc=int(np.clip(100-abs(loc_pos-0.70)*120,0,100))
+    else: loc=50
+    readiness=int(np.clip(0.35*align+0.35*setup['score']+0.20*trigger['score']+0.10*loc,0,100))
+    plan=make_plan(m15,direction,h1,h4,mode) if direction!='NEUTRAL' else None
+    rr=0 if not plan else (abs(plan['tp2']-plan['entry'])/max(abs(plan['entry']-plan['sl']),1e-9))
+    if direction=='NEUTRAL': status='WAIT'
+    elif mode=='Short Hold': status='ENTRY READY' if setup['setup'] and trigger['ok'] and align>=55 else 'WAIT'
+    else: status='ENTRY READY' if setup['setup'] and align>=55 else 'WAIT'
+    if status=='ENTRY READY':
+        reason=setup['name'] + (' + '+trigger['name'] if mode=='Short Hold' else '')
+    elif direction=='NEUTRAL': reason='รอ D1/H4/H1 ให้ทิศทางชัด'
+    elif not setup['setup']: reason='รอ M15 pullback / breakout / sweep'
+    elif mode=='Short Hold' and not trigger['ok']: reason='รอ M5 trigger'
+    else: reason='รอ alignment เพิ่ม'
+    return {'status':status,'direction':direction,'trend_d1':s1,'trend_h4':s4,'trend_h1':sH,'alignment':align,'setup':setup,'trigger':trigger,'range':m15range,'location':loc,'readiness':readiness,'plan':plan,'rr':rr,'reason':reason,'state_d1':i1['structure'],'state_h4':i4['structure'],'state_h1':iH['structure']}
 
 
-def _signal_id(symbol, mode, risk, signal_bar):
-    # Signal identity includes the completed M30 signal bar so a new setup is not
-    # confused with an older setup in the same direction.
-    ts=pd.Timestamp(signal_bar).strftime('%Y%m%d%H%M')
-    return f"{symbol}|{mode}|{risk['direction']}|{ts}"
+def fmt(v):
+    return '—' if v is None or not np.isfinite(v) else f'{v:,.2f}'
 
 
-def _evaluate_trade_on_bars(trade, m30_bars):
-    """Evaluate only bars strictly AFTER the signal bar.
-    This prevents look-ahead from using the signal candle's pre-entry range."""
-    if trade.get('Status') not in ('OPEN','TP1 HIT') or m30_bars is None or m30_bars.empty:
-        return
-    signal_bar=pd.Timestamp(trade['Signal Bar'])
-    future=m30_bars[m30_bars.index > signal_bar]
-    if future.empty:
-        return
-
-    for ts,row in future.iterrows():
-        hi=float(row.high); lo=float(row.low)
-        direction=trade['Direction']
-        if direction=='LONG':
-            hit_sl=lo<=trade['SL']; hit_tp1=hi>=trade['TP1']; hit_tp2=hi>=trade['TP2']
-        else:
-            hit_sl=hi>=trade['SL']; hit_tp1=lo<=trade['TP1']; hit_tp2=lo<=trade['TP2']
-
-        # Without intrabar sequencing we cannot know which was hit first.
-        # Review whenever SL and either target are both touched in the same bar.
-        if hit_sl and (hit_tp1 or hit_tp2):
-            trade['Status']='BOTH TOUCHED — REVIEW'
-            trade['Result R']=np.nan
-            trade['Exit Price']=np.nan
-            trade['Resolved Bar']=pd.Timestamp(ts).strftime('%Y-%m-%d %H:%M UTC')
-            return
-        if hit_tp2:
-            trade['Status']='TP2 HIT'
-            trade['Result R']=trade['RR2']
-            trade['Exit Price']=trade['TP2']
-            trade['Resolved Bar']=pd.Timestamp(ts).strftime('%Y-%m-%d %H:%M UTC')
-            return
-        if hit_tp1 and trade.get('Status')=='OPEN':
-            trade['Status']='TP1 HIT'
-            trade['Result R']=np.nan
-            trade['Exit Price']=trade['TP1']
-            trade['TP1 Bar']=pd.Timestamp(ts).strftime('%Y-%m-%d %H:%M UTC')
-            # Continue checking later bars for TP2/SL.
-            continue
-        if hit_sl:
-            if trade.get('Status')=='TP1 HIT':
-                trade['Status']='TP1 + SL'
-                trade['Result R']=0.5*trade['RR1']-0.5
-            else:
-                trade['Status']='SL HIT'
-                trade['Result R']=-1.0
-            trade['Exit Price']=trade['SL']
-            trade['Resolved Bar']=pd.Timestamp(ts).strftime('%Y-%m-%d %H:%M UTC')
-            return
+def card(result,title):
+    status=result['status']; direction=result['direction']
+    stt='🟢 ENTRY READY' if status=='ENTRY READY' and direction=='LONG' else '🔴 ENTRY READY' if status=='ENTRY READY' else '🟡 WAIT'
+    st.markdown(f'### {title}')
+    st.markdown(f'**{stt}** — {direction}')
+    a,b,c=st.columns(3)
+    a.metric('Trend D1',f"{result['trend_d1']}/100")
+    b.metric('Alignment H4/H1',f"{result['alignment']}/100")
+    c.metric('Setup Readiness',f"{result['readiness']}/100")
+    st.caption(f"H4 {result['state_h4']} • H1 {result['state_h1']} • M15 {result['setup']['name']} • M5 {result['trigger']['name']}")
+    st.info(f"สถานะ: {result['reason']}")
+    if result['plan']:
+        p=result['plan']; cols=st.columns(4)
+        cols[0].metric('Entry',fmt(p['entry'])); cols[1].metric('SL',fmt(p['sl'])); cols[2].metric('TP1',fmt(p['tp1'])); cols[3].metric('TP2',fmt(p['tp2']))
+        st.caption(f"M15 Range: {result['range']['zone']} • R:R to TP2 ≈ {result['rr']:.2f}R")
 
 
-def update_journal(symbol, mode, direction, risk, signal_bar, m30_bars):
-    init_journal()
-
-    # Always advance existing trades, even when the current setup is NO TRADE.
-    for trade in st.session_state.trade_journal:
-        if trade.get('Symbol') == symbol:
-            _evaluate_trade_on_bars(trade,m30_bars)
-
-    if not risk or direction=='NO TRADE':
-        return
-
-    sid=_signal_id(symbol,mode,risk,signal_bar)
-    existing=next((x for x in st.session_state.trade_journal if x['Signal ID']==sid),None)
-    if existing is None:
-        trade={
-            'Signal ID':sid,
-            'Signal Bar':pd.Timestamp(signal_bar).strftime('%Y-%m-%d %H:%M UTC'),
-            'Time':pd.Timestamp(signal_bar).strftime('%Y-%m-%d %H:%M UTC'),
-            'Symbol':symbol,
-            'Mode':mode.split(' — ')[1] if ' — ' in mode else mode,
-            'Direction':risk['direction'],
-            'Entry':risk['entry'],'SL':risk['sl'],'TP1':risk['tp1'],'TP2':risk['tp2'],
-            'Risk':risk['risk'],'RR1':risk['rr1'],'RR2':risk['rr2'],'Status':'OPEN',
-            'Result R':np.nan,'Exit Price':np.nan,'TP1 Bar':'','Resolved Bar':''
-        }
-        st.session_state.trade_journal.append(trade)
-
-def journal_stats():
-    init_journal()
-    df=pd.DataFrame(st.session_state.trade_journal)
-    if df.empty: return df, {}
-    closed=df[df['Result R'].notna()].copy()
-    wins=closed[closed['Result R']>0]
-    losses=closed[closed['Result R']<0]
-    gross_profit=float(wins['Result R'].sum()) if not wins.empty else 0.0
-    gross_loss=abs(float(losses['Result R'].sum())) if not losses.empty else 0.0
-    pf=(gross_profit/gross_loss) if gross_loss>0 else np.nan
-    eq=closed['Result R'].cumsum() if not closed.empty else pd.Series(dtype=float)
-    dd=float((eq.cummax()-eq).max()) if not eq.empty else 0.0
-    stats={'Trades':len(closed),'Open':int((df['Result R'].isna()).sum()),
-           'Win Rate':(len(wins)/len(closed)*100 if len(closed) else np.nan),
-           'Avg R':(float(closed['Result R'].mean()) if len(closed) else np.nan),
-           'Profit Factor':pf,'Max DD R':dd}
-    return df,stats
-
-def fmt(v): return f'{v:,.4f}'
-
-st.title('Gold & Bitcoin Trading Analyzer — V4.2.2')
-st.caption('V4.2.2 = M30-primary + Short Hold + Long Hold พร้อมกัน + Setup Readiness + look-ahead-safe journal. M5 เป็น proxy confirmation ไม่ใช่ true footprint/delta/DOM.')
+st.title('Gold & Bitcoin Trading Analyzer — V4.3')
+st.caption('D1 trend → H4/H1 range & structure → M15 setup → M5 entry trigger. Short Hold และ Long Hold แสดงพร้อมกัน')
 
 with st.sidebar:
     st.header('ตั้งค่าการวิเคราะห์')
-    asset=st.selectbox('สินทรัพย์',list(ASSETS.keys()),index=0, help='เรียง BTC/USD ก่อนตามที่กำหนด')
-    timeframe=st.selectbox('Timeframe หลัก',list(TF.keys()),index=2)
-    outputsize=st.select_slider('จำนวนแท่ง',options=[300,500,800],value=500)
-    auto=st.checkbox('Auto refresh',value=False)
-    refresh_seconds=st.slider('รอบรีเฟรช (วินาที)',30,300,60,step=30)
-    if st.button('รีเฟรชข้อมูลตอนนี้',use_container_width=True):
-        st.cache_data.clear(); st.rerun()
-    st.divider(); st.write('API: Twelve Data')
-    st.success('API key loaded') if API_KEY else st.error('ยังไม่มี API key')
+    asset_name=st.selectbox('สินทรัพย์',list(ASSETS.keys()),index=0)
+    symbol=ASSETS[asset_name]
+    chart_tf=st.selectbox('Timeframe กราฟ',list(TF.keys()),index=1)
+    outputsize=st.slider('จำนวนแท่ง',250,800,500,50)
+    auto=st.checkbox('Auto refresh',False)
+    refresh=st.slider('รอบรีเฟรช (วินาที)',30,300,60,10)
+    if st.button('รีเฟรชข้อมูลตอนนี้'): st.cache_data.clear(); st.rerun()
+    st.divider(); st.caption('API: Twelve Data')
 
-symbol=ASSETS[asset]
 if auto:
-    time.sleep(refresh_seconds); st.rerun()
+    st.markdown(f'<meta http-equiv="refresh" content="{refresh}">',unsafe_allow_html=True)
 
-main_df,err=get_ohlcv(symbol,TF[timeframe],outputsize)
-if err: st.error(err); st.stop()
-if len(main_df)<220: st.warning('ข้อมูลน้อยกว่า 220 แท่ง — EMA200/MTF อาจยังไม่นิ่ง')
+frames={}; errors=[]
+for label in ['1D','4h','1h','15m','5m']:
+    raw,err=get_ohlcv(symbol,TF[label],outputsize)
+    if err: errors.append(f'{label}: {err}')
+    frames[label]=indicators(raw) if not raw.empty else pd.DataFrame()
 
-# Use only completed candles for analysis and signal generation. The newest API bar can still be forming.
-main_full=add_indicators(main_df)
-d=main_full.iloc[:-1].copy() if len(main_full)>1 else main_full.copy()
-last_live=main_full.iloc[-1]
-last=d.iloc[-1]
-price=float(last_live.close); prev=float(main_full.close.iloc[-2]) if len(main_full)>=2 else price
-pct=(price/prev-1)*100 if prev else 0.0
-support,resistance=levels(d)
+chart_raw,chart_err=get_ohlcv(symbol,TF[chart_tf],outputsize)
+chart=indicators(chart_raw) if not chart_raw.empty else pd.DataFrame()
 
-frames={}; errors={}
-for tf in ANALYSIS_TFS:
-    x,er=get_ohlcv(symbol,TF[tf],outputsize)
-    if not er and len(x)>=220:
-        xx=add_indicators(x)
-        frames[tf]=xx.iloc[:-1].copy() if len(xx)>1 else xx.copy()
-    else: errors[tf]=er or 'ข้อมูลไม่พอ'
+if errors:
+    st.error(' | '.join(errors))
+    st.stop()
 
-# 30m is the primary setup timeframe; 5m is used only as the lowest-timeframe confirmation.
-five_df,five_err=get_ohlcv(symbol,'5min',max(250,min(800,outputsize)))
-if not five_err and len(five_df)>=40:
-    five_full=add_indicators(five_df)
-    five=five_full.iloc[:-1].copy() if len(five_full)>1 else five_full.copy()
-else:
-    five=pd.DataFrame()
-flow=proxy_orderflow(five)
-loc=fib_location(five if not five.empty else d)
-vp=volume_profile_proxy(five if not five.empty else d)
-env,env_score,env_reason=environment(frames.get('4h',d))
-regime=env
+price=float(chart.close.iloc[-1])
+prev=float(chart.close.iloc[-2]) if len(chart)>1 else price
+pct=(price/prev-1)*100 if prev else 0
+st.subheader(asset_name)
+st.metric('Price',fmt(price),f'{pct:+.2f}%')
 
-# Run both horizons at the same time. No mode selector is needed.
-mode_defs=[('1 — Short Hold','Short Hold'),('2 — Long Hold','Long Hold')]
-results={}
-for mode, label in mode_defs:
-    vsignal,vscore,alignment,details,gate_reason=v42_engine(frames,mode,flow)
-    risk,entry_reason=entry_plan(frames,vsignal,support,resistance,mode,flow,loc,vp) if vsignal!='NO TRADE' else (None,gate_reason)
-    setup_readiness,quality_parts=entry_quality(frames,vsignal,mode,flow,loc,vp,risk,vscore,alignment,details)
-    confidence=int(np.clip(.55*vscore+.25*alignment+.20*abs(flow['score']-50)*2,50,99)) if vsignal!='NO TRADE' else 0
-    results[label]={
-        'mode':mode,'signal':vsignal,'score':vscore,'alignment':alignment,
-        'details':details,'gate_reason':gate_reason,'risk':risk,
-        'entry_reason':entry_reason,'status_reason':(entry_reason if risk is None else gate_reason),'readiness':setup_readiness,
-        'quality_parts':quality_parts,'confidence':confidence
-    }
+short=evaluate(frames,'Short Hold')
+long=evaluate(frames,'Long Hold')
 
-# Update the journal for both horizons. Existing trades are still advanced only with
-# bars belonging to the same symbol, preventing cross-asset evaluation.
-for label in ('Short Hold','Long Hold'):
-    r=results[label]
-    update_journal(symbol,r['mode'],r['signal'],r['risk'],last.name,d)
+st.markdown('## สถานะการเทรด')
+c1,c2=st.columns(2)
+with c1: card(short,'Short Hold')
+with c2: card(long,'Long Hold')
 
-c1,c2,c3,c4=st.columns(4)
-c1.metric('Price',fmt(price),f'{pct:+.2f}%')
-c2.metric('Environment',f'{env}')
-c3.metric('5m Proxy Flow',f'{flow["score"]}/100',flow['state'])
-c4.metric('RSI',f'{last.RSI:.1f}')
-st.caption(f'แท่งวิเคราะห์ล่าสุด: {last.name.strftime("%Y-%m-%d %H:%M UTC")} • {symbol} • {timeframe}')
-
-st.subheader(f'สถานะพร้อมกัน — {asset}')
-sc1,sc2=st.columns(2)
-for col,label in ((sc1,'Short Hold'),(sc2,'Long Hold')):
-    r=results[label]
-    with col:
-        st.markdown(f'### {label}')
-        if r['signal']!='NO TRADE' and r['risk']:
-            st.success(f'{r["signal"]}')
-        else:
-            st.warning('NO TRADE')
-        m1,m2,m3=st.columns(3)
-        m1.metric('Trend',f'{r["score"]}/100')
-        m2.metric('Readiness',f'{r["readiness"]}/100')
-        m3.metric('Confidence',f'{r["confidence"]}%' if r['confidence'] else '—')
-        if r['risk']:
-            rr=r['risk']
-            st.write(f'Entry **{fmt(rr["entry"])}** • SL **{fmt(rr["sl"])}**')
-            st.write(f'TP1 **{fmt(rr["tp1"])}** ({rr["rr1"]:.2f}R) • TP2 **{fmt(rr["tp2"])}** ({rr["rr2"]:.2f}R)')
-            st.caption(f'Setup: {rr["setup"]} • Flow: {rr["flow_score"]}/100')
-        else:
-            st.write(f'ต้องรอ: **{r["status_reason"]}**')
-        st.write('Readiness: ' + ' • '.join(f'{k} {v}/100' for k,v in r['quality_parts'].items()))
-        st.caption('Readiness = ความพร้อมของ setup ไม่ใช่ win probability')
-
-fig=go.Figure(); fig.add_trace(go.Candlestick(x=d.index,open=d.open,high=d.high,low=d.low,close=d.close,name=symbol))
-for col in ['EMA20','EMA50','EMA200']: fig.add_trace(go.Scatter(x=d.index,y=d[col],name=col,mode='lines'))
-fig.add_hline(y=support,annotation_text='Support',line_dash='dot'); fig.add_hline(y=resistance,annotation_text='Resistance',line_dash='dot')
-if vp: fig.add_hline(y=vp['poc'],annotation_text='Proxy POC',line_dash='dash')
-fig.update_layout(height=620,xaxis_rangeslider_visible=False,margin=dict(l=10,r=10,t=30,b=10)); st.plotly_chart(fig,use_container_width=True)
-
-left,right=st.columns(2)
-with left:
-    st.subheader('Environment / Location')
-    st.write(f'Environment: **{env}** ({env_score}/100)')
-    st.write(f'Path/session: **{session_label(last.name)}**')
-    st.write(f'Fib location: **{loc.get("label","N/A")}**')
-    if 'z705' in loc: st.write(f'Fib 0.705 / 0.788 / 0.886: **{fmt(loc["z705"])} / {fmt(loc["z788"])} / {fmt(loc["z886"])}**')
-    if vp: st.write(f'Proxy value: **{vp["location"]}** • POC **{fmt(vp["poc"])}**')
-with right:
-    st.subheader('Proxy Order Flow — 5m Confirmation')
-    st.write(f'State: **{flow["state"]}** • Score **{flow["score"]}/100**')
-    if np.isfinite(flow.get('participation',np.nan)): st.write(f'Participation: **{flow["participation"]:.2f}x** vs 20-bar average')
-    st.write(' • '.join(flow['reasons']) if flow['reasons'] else 'ยังไม่พบ confirmation')
-    st.caption('ใช้ candle + relative volume เป็น proxy เท่านั้น; ไม่ใช่ bid/ask delta, footprint หรือ DOM')
-
-st.subheader('รายละเอียด Entry / SL / TP')
-d1,d2=st.columns(2)
-for col,label in ((d1,'Short Hold'),(d2,'Long Hold')):
-    r=results[label]
-    with col:
-        st.markdown(f'**{label}**')
-        if r['risk']:
-            rr=r['risk']
-            st.write(f'ENTRY READY — **{rr["direction"]}**')
-            st.write(f'Entry: **{fmt(rr["entry"])}**')
-            st.write(f'SL: **{fmt(rr["sl"])}**')
-            st.write(f'TP1: **{fmt(rr["tp1"])}** • TP2: **{fmt(rr["tp2"])}**')
-            st.caption(f'Risk/Unit: {fmt(rr["risk"])} • Signal ID: {_signal_id(symbol,r["mode"],rr,last.name)}')
-        else:
-            st.write(f'WAIT / NO TRADE — **{r["status_reason"]}**')
-        st.write(' • '.join(f'{k} {v}/100' for k,v in r['quality_parts'].items()))
-
-st.subheader('Trade Journal / Statistics')
-jdf,jstats=journal_stats()
-if jdf.empty:
-    st.info('ยังไม่มีสัญญาณ ENTRY READY ที่ถูกบันทึกใน session นี้')
-else:
-    sc1,sc2,sc3,sc4,sc5,sc6=st.columns(6)
-    sc1.metric('Closed Trades',jstats.get('Trades',0))
-    sc2.metric('Win Rate',f"{jstats['Win Rate']:.1f}%" if np.isfinite(jstats.get('Win Rate',np.nan)) else '—')
-    sc3.metric('Average R',f"{jstats['Avg R']:+.2f}" if np.isfinite(jstats.get('Avg R',np.nan)) else '—')
-    sc4.metric('Profit Factor',f"{jstats['Profit Factor']:.2f}" if np.isfinite(jstats.get('Profit Factor',np.nan)) else '—')
-    sc5.metric('Max DD',f"{jstats['Max DD R']:.2f}R")
-    sc6.metric('Open',jstats.get('Open',0))
-    show_cols=['Signal ID','Signal Bar','Symbol','Mode','Direction','Entry','SL','TP1','TP2','Status','Result R']
-    st.dataframe(jdf[show_cols].tail(20),hide_index=True,use_container_width=True)
-    csv=jdf.to_csv(index=False).encode('utf-8-sig')
-    st.download_button('ดาวน์โหลด Trade Journal CSV',csv,file_name='v42_trade_journal.csv',mime='text/csv',use_container_width=True)
-    if st.button('ล้าง Journal ใน Session',use_container_width=True):
-        st.session_state.trade_journal=[]
-        st.rerun()
-    st.caption('Cooldown: 1 active setup ต่อ Symbol + Mode + Direction. Signal ID ผูกกับแท่ง M30 ที่ปิดแล้ว; ผลลัพธ์ตรวจเฉพาะแท่ง M30 หลัง Entry. Journal อยู่ใน session นี้เท่านั้น')
-
-st.subheader(f'Top-Down Multi-Timeframe — {asset}')
-# Show both horizons in one table, so the user can compare without switching modes.
+st.markdown('## โครงสร้างตลาด')
 rows=[]
-for tf in ANALYSIS_TFS:
-    if tf in results['Short Hold']['details']:
-        z=results['Short Hold']['details'][tf]
-        rows.append([tf,z['Bias'],z['Strength'],z['Structure'],z['Environment'],z['EnvScore'],z['Reason']])
-    else:
-        rows.append([tf,'ERROR','—','—','—','—',errors.get(tf,'ไม่มีข้อมูล')])
-st.dataframe(pd.DataFrame(rows,columns=['TF','Bias','Strength','Structure','Environment','EnvScore','Reason']),hide_index=True,use_container_width=True)
+for tf in ['1D','4h','1h','15m','5m']:
+    d=frames[tf]; b,s,info=trend_score(d); rg=range_info(d,48)
+    rows.append({'TF':tf,'Bias':b,'Trend':s,'Structure':info['structure'],'Range':rg['zone'],'Range High':rg['high'],'Range Low':rg['low']})
+st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
 
-st.subheader('Current Setup')
-flags=setup_flags(d); active=[]
-labels={'bull_breakout':'Bullish Breakout','bear_breakdown':'Bearish Breakdown','bull_pullback':'Bullish Pullback','bear_pullback':'Bearish Pullback','bull_sweep':'Bullish Liquidity Sweep','bear_sweep':'Bearish Liquidity Sweep'}
-for k,v in flags.items():
-    if v: active.append(labels[k])
-st.write(' • '.join(active) if active else 'ยังไม่พบ setup ที่ผ่านโครงสร้างล่าสุด')
+st.markdown(f'## กราฟ {chart_tf}')
+fig=go.Figure()
+fig.add_trace(go.Candlestick(x=chart.index,open=chart.open,high=chart.high,low=chart.low,close=chart.close,name='Price'))
+for n in (20,50,200):
+    if f'EMA{n}' in chart: fig.add_trace(go.Scatter(x=chart.index,y=chart[f'EMA{n}'],name=f'EMA{n}',mode='lines'))
+fig.update_layout(height=520,xaxis_rangeslider_visible=False,margin=dict(l=10,r=10,t=30,b=10))
+st.plotly_chart(fig,use_container_width=True)
 
-st.subheader('Indicator Snapshot')
-st.dataframe(pd.DataFrame([
-    ['EMA20',float(last.EMA20)],['EMA50',float(last.EMA50)],['EMA200',float(last.EMA200)],
-    ['RSI14',float(last.RSI)],['MACD',float(last.MACD)],['MACD Signal',float(last.MACDsig)],['ATR14',float(last.ATR)],['ATR %',float(last.ATR_pct)]
-],columns=['Indicator','Value']),hide_index=True,use_container_width=True)
-
-st.caption('V4.2.2 ไม่ส่งคำสั่งซื้อขายอัตโนมัติ. M30 คือ timeframe หลัก; M5 เป็น order-flow proxy. Short Hold และ Long Hold แสดงพร้อมกัน ไม่ต้องเลือกโหมด. BTC/USD อยู่ลำดับแรกในรายการสินทรัพย์. Score/Confidence ไม่ใช่ win probability.')
+st.markdown('## วิธีอ่านระบบ')
+st.write('D1 ใช้กำหนดทิศทางหลักของวัน. H4 และ H1 ใช้ดูโครงสร้างและตำแหน่งราคาในช่วง. M15 ใช้หา setup เช่น pullback, breakout หรือ sweep. M5 ใช้เป็น trigger สำหรับ Short Hold และเป็นข้อมูลประกอบสำหรับ Long Hold. ระบบไม่ถือว่า Trend Score เป็นโอกาสชนะและไม่ใช้ M5 เป็น true order flow.')
