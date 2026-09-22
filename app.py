@@ -5,7 +5,7 @@ import requests
 import streamlit as st
 import plotly.graph_objects as go
 
-st.set_page_config(page_title='Gold & Bitcoin Trading Analyzer V4.6', page_icon='📈', layout='wide')
+st.set_page_config(page_title='Gold & Bitcoin Trading Analyzer V4.7', page_icon='📈', layout='wide')
 
 BASE = 'https://api.twelvedata.com'
 ASSETS = {'Bitcoin BTC/USD': 'BTC/USD', 'Gold XAU/USD': 'XAU/USD'}
@@ -304,59 +304,87 @@ def make_plan(frames, direction, mode):
 
 def evaluate(frames, mode):
     ctx = macro_context(frames['1D'], frames['4h'], frames['1h'], frames['15m'])
-    # H4/H1 define the tactical range; M15 defines the setup; M5 defines the entry trigger.
+    # Hierarchy: D1/H4 = macro, H1/M15 = tactical, M15 = setup, M5 = trigger.
     tactical = ctx['tactical']
+    macro = ctx['macro']
+
+    # Short Hold follows tactical direction. It may trade against the macro trend,
+    # but that case is explicitly classified as COUNTER-MACRO rather than a normal trend entry.
     short_dir = tactical
     short_loc = range_location(frames['4h'], frames['1h'], short_dir)
     short_setup = m15_setup(frames['15m'], short_dir)
     short_trig = m5_trigger(frames['5m'], short_dir)
 
-    macro = ctx['macro']
+    # Long Hold follows macro direction. A tactical counter-move is a pullback/rebound
+    # and can never be labeled ENTRY READY until tactical direction realigns with macro.
     long_loc = range_location(frames['4h'], frames['1h'], macro)
     long_setup = m15_setup(frames['15m'], macro)
     long_trig = m5_trigger(frames['5m'], macro)
 
+    aligned = macro in ('LONG','SHORT') and tactical == macro
+    counter_macro = macro in ('LONG','SHORT') and tactical in ('LONG','SHORT') and tactical != macro
+
     if mode == 'Short Hold':
-        direction=short_dir
+        direction = short_dir
+        setup, trig, loc = short_setup, short_trig, short_loc
         if direction == 'NEUTRAL':
-            status='WAIT'; reason='H1/M15 ยังไม่ให้ tactical direction'
+            status = 'WAIT'; reason = 'H1/M15 ยังไม่ให้ tactical direction'; entry_class = 'WAIT'
         elif short_setup['ok'] and short_trig['ok']:
-            status='ENTRY READY'; reason=f"{short_setup['name']} • {short_trig['name']} • {short_loc['zone']}"
+            status = 'ENTRY READY'
+            entry_class = 'TREND ENTRY' if aligned else 'COUNTER-MACRO ENTRY' if counter_macro else 'TACTICAL ENTRY'
+            prefix = 'ตาม Macro' if aligned else 'สวน Macro ระยะสั้น' if counter_macro else 'Macro ยังไม่ชัด'
+            reason = f"{prefix} • {short_setup['name']} • {short_trig['name']} • {short_loc['zone']}"
         elif short_setup['ok'] or short_setup['near']:
-            status='PRE-ENTRY'; reason=f"{short_setup['name']} • {short_trig['name']} • {short_loc['reason']}"
+            status = 'PRE-ENTRY'
+            entry_class = 'COUNTER-MACRO WATCH' if counter_macro else 'TREND WATCH' if aligned else 'TACTICAL WATCH'
+            reason = f"{short_setup['name']} • {short_trig['name']} • {short_loc['reason']}"
         else:
-            status='WAIT'; reason=short_setup['name']
-        setup,trig,loc=short_setup,short_trig,short_loc
+            status = 'WAIT'; entry_class = 'WAIT'; reason = short_setup['name']
     else:
-        direction=macro
+        direction = macro
+        setup, trig, loc = long_setup, long_trig, long_loc
         if direction == 'NEUTRAL':
-            status='WAIT'; reason='D1/H4 ยังไม่ให้ Macro direction'
-        elif tactical != direction:
-            # Counter-macro movement is a pullback. Long Hold waits for M15 to resume macro direction.
-            status='ENTRY READY' if long_setup['ok'] and long_trig['ok'] else 'PRE-ENTRY' if long_setup['ok'] or long_setup['near'] else 'WAIT'
-            reason=f"Macro {direction} • Tactical {tactical} = pullback/rebound ภายใน Macro • {long_setup['name']} • {long_trig['name']}"
+            status = 'WAIT'; entry_class = 'WAIT'; reason = 'D1/H4 ยังไม่ให้ Macro direction'
+        elif counter_macro:
+            # Critical V4.7 rule: Long Hold must not produce an executable entry while
+            # tactical H1/M15 is still opposite to D1/H4 macro.
+            status = 'PRE-ENTRY' if (long_setup['ok'] or long_setup['near']) else 'WAIT'
+            entry_class = 'PULLBACK / RESUME'
+            reason = (f"Macro {direction} • Tactical {tactical} = pullback/rebound ภายใน Macro • "
+                      f"รอ H1/M15 กลับ {direction} • {long_setup['name']} • {long_trig['name']}")
         elif long_setup['ok'] and long_trig['ok']:
-            status='ENTRY READY'; reason=f"{long_setup['name']} • {long_trig['name']} • {long_loc['zone']}"
+            status = 'ENTRY READY'; entry_class = 'TREND ENTRY'
+            reason = f"Macro/Tactical aligned • {long_setup['name']} • {long_trig['name']} • {long_loc['zone']}"
         elif long_setup['ok'] or long_setup['near']:
-            status='PRE-ENTRY'; reason=f"{long_setup['name']} • {long_trig['name']}"
+            status = 'PRE-ENTRY'; entry_class = 'TREND WATCH'
+            reason = f"{long_setup['name']} • {long_trig['name']} • {long_loc['reason']}"
         else:
-            status='WAIT'; reason=long_setup['name']
-        setup,trig,loc=long_setup,long_trig,long_loc
+            status = 'WAIT'; entry_class = 'WAIT'; reason = long_setup['name']
 
-    # Location is informative, not a hard veto. This prevents the previous engine from producing almost no entries.
-    readiness=int(np.clip(0.30*ctx['macro_strength'] + 0.25*ctx['tactical_strength'] + 0.20*setup['score'] + 0.15*trig['score'] + 0.10*loc['score'],0,100))
-    plan=make_plan(frames,direction,mode) if status=='ENTRY READY' else None
-    if status=='ENTRY READY' and plan is None:
-        status='PRE-ENTRY'; reason='สัญญาณครบ แต่โครงสร้าง SL กว้างเกินไป — รอราคาเข้าโครงสร้างใหม่'
+    # Readiness describes setup quality, not probability of profit. Location is informative,
+    # not a hard veto, so the engine does not become excessively restrictive.
+    readiness = int(np.clip(
+        0.30*ctx['macro_strength'] +
+        0.25*ctx['tactical_strength'] +
+        0.20*setup['score'] +
+        0.15*trig['score'] +
+        0.10*loc['score'], 0, 100))
 
-    relation='ALIGNED' if ctx['macro']==ctx['tactical'] and ctx['macro']!='NEUTRAL' else 'COUNTER-MACRO' if ctx['macro']!='NEUTRAL' and ctx['tactical']!='NEUTRAL' else 'MIXED'
+    plan = make_plan(frames, direction, mode) if status == 'ENTRY READY' else None
+    if status == 'ENTRY READY' and plan is None:
+        status = 'PRE-ENTRY'
+        entry_class = 'COUNTER-MACRO WATCH' if counter_macro else 'TREND WATCH'
+        reason = 'สัญญาณครบ แต่โครงสร้าง SL กว้างเกินไป — รอราคาเข้าโครงสร้างใหม่'
+
+    relation = 'ALIGNED' if aligned else 'COUNTER-MACRO' if counter_macro else 'MIXED'
     return {
-        'status':status,'direction':direction,'macro':ctx['macro'],'tactical':ctx['tactical'],
-        'macro_strength':ctx['macro_strength'],'tactical_strength':ctx['tactical_strength'],
-        'relation':relation,'trend_d1':ctx['d1']['score'],'h4_score':ctx['h4']['score'],'h1_score':ctx['h1']['score'],
-        'alignment':int(round((ctx['h4']['score']+ctx['h1']['score'])/2)),
-        'setup':setup,'trigger':trig,'range':range_info(frames['15m'],48),'location':loc,
-        'readiness':readiness,'plan':plan,'reason':reason,'states':ctx,
+        'status': status, 'direction': direction, 'macro': macro, 'tactical': tactical,
+        'macro_strength': ctx['macro_strength'], 'tactical_strength': ctx['tactical_strength'],
+        'relation': relation, 'entry_class': entry_class,
+        'trend_d1': ctx['d1']['score'], 'h4_score': ctx['h4']['score'], 'h1_score': ctx['h1']['score'],
+        'alignment': int(round((ctx['h4']['score']+ctx['h1']['score'])/2)),
+        'setup': setup, 'trigger': trig, 'range': range_info(frames['15m'],48), 'location': loc,
+        'readiness': readiness, 'plan': plan, 'reason': reason, 'states': ctx,
     }
 
 def fmt(v):
@@ -366,14 +394,21 @@ def fmt(v):
 def render_card(result, title):
     ready = result['status'] == 'ENTRY READY'
     pre = result['status'] == 'PRE-ENTRY'
-    icon = '🟢' if ready and result['direction'] == 'LONG' else '🔴' if ready else '🟡'
+    counter = result['entry_class'] == 'COUNTER-MACRO ENTRY'
+    icon = '🟢' if ready and result['direction'] == 'LONG' and not counter else '🔴' if ready and result['direction'] == 'SHORT' and not counter else '⚠️' if counter else '🟡'
     st.markdown(f'### {title}')
     st.markdown(f'**{icon} {result["status"]} — {result["direction"]}**')
+    if counter:
+        st.warning('COUNTER-MACRO ENTRY — สัญญาณนี้สวนทิศทาง D1/H4 และมีไว้สำหรับ Short Hold เท่านั้น')
+    elif result['entry_class'] == 'PULLBACK / RESUME':
+        st.info('PULLBACK / RESUME — Macro กับ Tactical ยังสวนกัน จึงยังไม่ถือเป็น Long Hold entry')
+    elif result['entry_class'] == 'TREND ENTRY':
+        st.caption('TREND ENTRY — Macro และ Tactical ไปทางเดียวกัน')
     a,b,c = st.columns(3)
     a.metric('Macro D1/H4', f"{result['macro']} {result['macro_strength']}/100")
     b.metric('Tactical H1/M15', f"{result['tactical']} {result['tactical_strength']}/100")
     c.metric('Setup Readiness', f"{result['readiness']}/100")
-    st.caption(f"Macro {result['macro']} • Tactical {result['tactical']} • {result['relation']} • H4/H1 {result['location']['zone']} • M15 {result['setup']['name']} • M5 {result['trigger']['name']}")
+    st.caption(f"Signal Class: {result['entry_class']} • Macro {result['macro']} • Tactical {result['tactical']} • {result['relation']} • H4/H1 {result['location']['zone']} • M15 {result['setup']['name']} • M5 {result['trigger']['name']}")
     if pre:
         st.info(f"PRE-ENTRY: {result['reason']}")
     elif ready:
@@ -389,7 +424,7 @@ def render_card(result, title):
         st.caption('ยังไม่แสดง Entry / SL / TP จนกว่าจะเกิด ENTRY READY')
 
 
-st.title('Gold & Bitcoin Trading Analyzer — V4.6')
+st.title('Gold & Bitcoin Trading Analyzer — V4.7')
 st.caption('D1 trend → H4/H1 structure & range → M15 setup → M5 entry trigger. Short Hold และ Long Hold แสดงพร้อมกัน')
 
 with st.sidebar:
@@ -443,5 +478,5 @@ fig=go.Figure(); fig.add_trace(go.Candlestick(x=chart.index,open=chart.open,high
 for n in (20,50,200): fig.add_trace(go.Scatter(x=chart.index,y=chart[f'EMA{n}'],name=f'EMA{n}',mode='lines'))
 fig.update_layout(height=520,xaxis_rangeslider_visible=False,margin=dict(l=10,r=10,t=30,b=10)); st.plotly_chart(fig,use_container_width=True)
 
-st.markdown('## หลักการของ V4.6')
-st.write('D1 = แนวโน้มหลัก. H4/H1 = โครงสร้างและตำแหน่งใน range. M15 = setup. M5 = entry trigger. Short Hold ตาม tactical H1/M15 และ Long Hold ตาม macro D1/H4; ถ้า H1/M15 สวน Macro ให้ถือเป็น pullback/rebound และรอการกลับทิศบน M15/M5. ระบบตรวจ setup/trigger ย้อนหลัง 3 แท่งที่ปิดแล้วเพื่อไม่พลาดจังหวะระหว่างรอบ refresh. Entry/SL/TP แสดงเฉพาะ ENTRY READY.')
+st.markdown('## หลักการของ V4.7')
+st.write('D1/H4 = Macro. H1/M15 = Tactical. M15 = setup. M5 = trigger. Short Hold ตาม Tactical และสามารถเป็น COUNTER-MACRO ได้ แต่ระบบต้องติดป้ายชัดเจน. Long Hold ตาม Macro และห้ามแสดง ENTRY READY ขณะ Tactical ยังสวน Macro; ต้องรอ H1/M15 กลับทิศ. TREND ENTRY = Macro/Tactical aligned. COUNTER-MACRO ENTRY = Short Hold สวน Macro. PULLBACK / RESUME = Long Hold กำลังรอ Tactical กลับเข้า Macro. ระบบตรวจ setup/trigger ย้อนหลัง 3 แท่งที่ปิดแล้ว. Entry/SL/TP แสดงเฉพาะ ENTRY READY.')
