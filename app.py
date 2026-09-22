@@ -324,32 +324,49 @@ def make_plan(frames, direction, mode):
     entry = float(m5.close.iloc[-1])
     atr5 = max(float(m5.ATR.iloc[-1]), 1e-9)
     atr15 = max(float(m15.ATR.iloc[-1]), 1e-9)
+    # Minimum stop distance as a multiple of ATR. Without this floor, a
+    # sweep/reclaim trigger (where entry sits right at the swing point by
+    # construction) can produce a risk of just the 0.25/0.30*ATR buffer —
+    # too tight for normal noise on a volatile instrument. The structural
+    # (swing-based) stop is still used whenever it's already wider than this.
+    MIN_RISK_ATR_MULT_5M = 1.0
+    MIN_RISK_ATR_MULT_15M = 1.2
     if mode == 'Short Hold':
+        min_risk, max_risk = MIN_RISK_ATR_MULT_5M*atr5, 2.8*atr5
         if direction == 'LONG':
             swing = float(m5.tail(12).low.min())
             sl = swing - 0.25*atr5
             risk = entry - sl
-            if risk <= 0 or risk > 2.8*atr5: return None
+            if 0 < risk < min_risk:
+                risk = min_risk; sl = entry - risk
+            if risk <= 0 or risk > max_risk: return None
             tp1, tp2 = entry + 1.2*risk, entry + 1.8*risk
         else:
             swing = float(m5.tail(12).high.max())
             sl = swing + 0.25*atr5
             risk = sl - entry
-            if risk <= 0 or risk > 2.8*atr5: return None
+            if 0 < risk < min_risk:
+                risk = min_risk; sl = entry + risk
+            if risk <= 0 or risk > max_risk: return None
             tp1, tp2 = entry - 1.2*risk, entry - 1.8*risk
     else:
         entry = float(m15.close.iloc[-1])
+        min_risk, max_risk = MIN_RISK_ATR_MULT_15M*atr15, 5.0*atr15
         if direction == 'LONG':
             swing = min(float(m15.tail(14).low.min()), float(h1.tail(10).low.min()))
             sl = swing - 0.30*atr15
             risk = entry - sl
-            if risk <= 0 or risk > 5.0*atr15: return None
+            if 0 < risk < min_risk:
+                risk = min_risk; sl = entry - risk
+            if risk <= 0 or risk > max_risk: return None
             tp1, tp2 = entry + 1.5*risk, entry + 3.0*risk
         else:
             swing = max(float(m15.tail(14).high.max()), float(h1.tail(10).high.max()))
             sl = swing + 0.30*atr15
             risk = sl - entry
-            if risk <= 0 or risk > 5.0*atr15: return None
+            if 0 < risk < min_risk:
+                risk = min_risk; sl = entry + risk
+            if risk <= 0 or risk > max_risk: return None
             tp1, tp2 = entry - 1.5*risk, entry - 3.0*risk
     return {'entry': entry, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'risk': risk, 'rr': abs(tp2-entry)/risk}
 
@@ -526,7 +543,14 @@ if chart.empty:
     st.error('ไม่มีข้อมูลสำหรับกราฟ/ราคาปัจจุบัน — อาจถูก rate-limit ลองกด "รีเฟรชข้อมูลตอนนี้" อีกครั้งในอีกสักครู่')
     st.stop()
 
-price = float(chart.close.iloc[-1]); prev = float(chart.close.iloc[-2]) if len(chart)>1 else price
+# Use the freshest closed candle (5m) for the headline price whenever it's
+# available, rather than whatever chart timeframe the user has selected. A
+# 15m/1h/4h/1D "last close" can lag the actual market by up to that whole
+# interval, which made the header disagree with Short Hold's 5m-based Entry
+# by hundreds of dollars on a fast-moving asset like BTC. Falls back to the
+# chart's own series if 5m data isn't available this refresh.
+price_src = frames.get('5m') if not frames.get('5m', pd.DataFrame()).empty else chart
+price = float(price_src.close.iloc[-1]); prev = float(price_src.close.iloc[-2]) if len(price_src)>1 else price
 pct = (price/prev-1)*100 if prev else 0
 st.subheader(asset_name); st.metric('Price', fmt(price), f'{pct:+.2f}%')
 
