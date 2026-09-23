@@ -302,6 +302,34 @@ def m5_trigger(d, direction):
     return {'ok':False,'score':int(score),'name':'รอ M5 กลับขึ้น' if direction=='LONG' else 'รอ M5 กลับลง','type':'NONE'}
 
 
+def scan_signals(d, threshold=55):
+    """View-only chart overlay: scan every closed bar in d for a BUY/SELL
+    trigger using the same per-bar scoring rules as m5_trigger. Unlike the
+    Short Hold / Long Hold cards above, this does NOT check macro/tactical
+    alignment or place any order — it just marks where the raw candle
+    pattern fired on this timeframe, similar to a signal-marker chart."""
+    buys, sells = [], []
+    if d is None or len(d) < 2:
+        return buys, sells
+    for i in range(1, len(d)):
+        x, p = d.iloc[i], d.iloc[i-1]
+        rg = max(float(x.range), 1e-9)
+        vr = float(x.VolRatio) if np.isfinite(x.VolRatio) else 1.0
+        bull_break=x.close>p.high and x.close>x.open and x.body_ratio>=0.20
+        bear_break=x.close<p.low and x.close<x.open and x.body_ratio>=0.20
+        bull_reclaim=x.close>x.EMA20 and p.close<=p.EMA20 and x.close>x.open
+        bear_reclaim=x.close<x.EMA20 and p.close>=p.EMA20 and x.close<x.open
+        bull_reject=x.lower_wick>=0.20*rg and x.close>x.open and x.close>=x.low+0.55*rg
+        bear_reject=x.upper_wick>=0.20*rg and x.close<x.open and x.close<=x.high-0.55*rg
+        long_score=min(100, 40*int(bull_break)+35*int(bull_reclaim)+25*int(bull_reject)+10*int(vr>=1.0)+20*int(x.close>x.EMA20))
+        short_score=min(100, 40*int(bear_break)+35*int(bear_reclaim)+25*int(bear_reject)+10*int(vr>=1.0)+20*int(x.close<x.EMA20))
+        if long_score>=threshold:
+            buys.append({'time': x.name, 'price': float(x.low), 'score': int(long_score)})
+        if short_score>=threshold:
+            sells.append({'time': x.name, 'price': float(x.high), 'score': int(short_score)})
+    return buys, sells
+
+
 def range_location(h4,h1,direction):
     if direction not in ('LONG','SHORT'):
         return {'score':50,'zone':'MIXED','reason':'ยังไม่มี direction'}
@@ -509,6 +537,10 @@ with st.sidebar:
     if st.button('รีเฟรชข้อมูลตอนนี้'):
         st.cache_data.clear(); st.rerun()
     st.divider()
+    show_signals = st.checkbox('แสดงจุด BUY/SELL บนกราฟ (ย้อนหลัง)', True,
+                                help='มาร์กเกอร์ดูสัญญาณเฉยๆ ไม่ได้ส่งคำสั่งจริง และไม่ได้กรองด้วย Macro/Tactical เหมือนการ์ดสถานะการเทรด')
+    signal_threshold = st.slider('เกณฑ์คะแนนสัญญาณ (ยิ่งสูงยิ่งเข้ม)', 40, 90, 55, 5) if show_signals else 55
+    st.divider()
     st.caption(f'API: Twelve Data • cache {CACHE_TTL}s • โหลดต่อครั้ง 5 คำขอ (ไม่มีคำขอซ้ำสำหรับกราฟ)')
     st.caption('ออกแบบให้ประหยัด API credit สำหรับ free-plan key: คำขอถูกหน่วงเวลา, cache ยาวขึ้น, และมี fallback ไปใช้ข้อมูลล่าสุดที่ดึงสำเร็จเมื่อคำขอถูก rate-limit')
 
@@ -577,7 +609,21 @@ st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 st.markdown(f'## กราฟ {chart_tf}')
 fig=go.Figure(); fig.add_trace(go.Candlestick(x=chart.index,open=chart.open,high=chart.high,low=chart.low,close=chart.close,name='Price'))
 for n in (20,50,200): fig.add_trace(go.Scatter(x=chart.index,y=chart[f'EMA{n}'],name=f'EMA{n}',mode='lines'))
+if show_signals and not chart.empty:
+    buys, sells = scan_signals(chart, signal_threshold)
+    if buys:
+        fig.add_trace(go.Scatter(
+            x=[b['time'] for b in buys], y=[b['price'] for b in buys], mode='markers', name='BUY',
+            marker=dict(symbol='triangle-up', size=11, color='#22c55e', line=dict(width=1, color='#ffffff')),
+            text=[f"BUY {b['score']}%" for b in buys], hovertemplate='%{text}<br>%{y}<extra></extra>'))
+    if sells:
+        fig.add_trace(go.Scatter(
+            x=[s['time'] for s in sells], y=[s['price'] for s in sells], mode='markers', name='SELL',
+            marker=dict(symbol='triangle-down', size=11, color='#ef4444', line=dict(width=1, color='#ffffff')),
+            text=[f"SELL {s['score']}%" for s in sells], hovertemplate='%{text}<br>%{y}<extra></extra>'))
 fig.update_layout(height=520,xaxis_rangeslider_visible=False,margin=dict(l=10,r=10,t=30,b=10)); st.plotly_chart(fig,use_container_width=True)
+if show_signals:
+    st.caption('จุด BUY/SELL คือสัญญาณจากรูปแบบแท่งเทียนของไทม์เฟรมนี้เท่านั้น (ดูอย่างเดียว ไม่ส่งคำสั่งจริง) — ไม่ได้กรองด้วย Macro/Tactical เหมือนการ์ด "สถานะการเทรด" ด้านบน ดังนั้นอาจมีจุดที่สวนทางกับ Short/Long Hold ได้')
 
 st.markdown('## หลักการของ V4.7')
 st.write('D1/H4 = Macro. H1/M15 = Tactical. M15 = setup. M5 = trigger. Short Hold ตาม Tactical และสามารถเป็น COUNTER-MACRO ได้ แต่ระบบต้องติดป้ายชัดเจน. Long Hold ตาม Macro และห้ามแสดง ENTRY READY ขณะ Tactical ยังสวน Macro; ต้องรอ H1/M15 กลับทิศ. TREND ENTRY = Macro/Tactical aligned. COUNTER-MACRO ENTRY = Short Hold สวน Macro. PULLBACK / RESUME = Long Hold กำลังรอ Tactical กลับเข้า Macro. ระบบตรวจ setup/trigger ย้อนหลัง 3 แท่งที่ปิดแล้ว. Entry/SL/TP แสดงเฉพาะ ENTRY READY.')
