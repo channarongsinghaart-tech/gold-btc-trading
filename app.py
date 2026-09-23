@@ -646,34 +646,39 @@ if show_signals and not chart.empty:
             marker=dict(symbol='triangle-down', size=11, color='#ef4444', line=dict(width=1, color='#ffffff')),
             text=[f"SELL {s['score']}%" for s in sells], hovertemplate='%{text}<br>%{y}<extra></extra>'))
 if show_zone and not chart.empty and len(chart) > 20:
-    # Pick which mode's direction to project: prefer whichever is actively
-    # waiting to enter (PRE-ENTRY — literally "watching for the next pullback
-    # entry"), then fall back to whichever has a live direction at all.
-    zone_dir, zone_label = None, None
+    # Draw one zone per mode that is actually PRE-ENTRY (waiting on a
+    # pullback) — both Short Hold and Long Hold can show at once if both are
+    # pending, e.g. a SHORT zone alongside a LONG zone during a counter-macro
+    # setup. If neither is PRE-ENTRY, fall back to showing just one mode's
+    # current direction so the chart isn't empty of context.
+    zones = []
     for res, label in ((short, 'Short Hold'), (long, 'Long Hold')):
         if res and res['status'] == 'PRE-ENTRY' and res['direction'] in ('LONG','SHORT'):
-            zone_dir, zone_label = res['direction'], label; break
-    if zone_dir is None:
+            zones.append((res['direction'], label))
+    if not zones:
         for res, label in ((short, 'Short Hold'), (long, 'Long Hold')):
             if res and res['direction'] in ('LONG','SHORT'):
-                zone_dir, zone_label = res['direction'], label; break
+                zones.append((res['direction'], label)); break
     last = chart.iloc[-1]
     ema20_last, atr_last = float(last.EMA20), float(last.ATR)
-    if zone_dir and np.isfinite(ema20_last) and np.isfinite(atr_last) and atr_last > 0:
+    if zones and np.isfinite(ema20_last) and np.isfinite(atr_last) and atr_last > 0:
         zone_lo, zone_hi = ema20_last - 0.75*atr_last, ema20_last + 0.75*atr_last
-        color = 'rgba(34,197,94,0.16)' if zone_dir == 'LONG' else 'rgba(239,68,68,0.16)'
-        line_color = '#22c55e' if zone_dir == 'LONG' else '#ef4444'
         deltas = chart.index.to_series().diff().dropna()
         step = deltas.median() if len(deltas) else pd.Timedelta(minutes=15)
-        x0, x1 = chart.index[-1], chart.index[-1] + step*15
-        fig.add_shape(type='rect', xref='x', yref='y', x0=x0, x1=x1, y0=zone_lo, y1=zone_hi,
-                      fillcolor=color, line=dict(width=1, color=line_color, dash='dot'), layer='below')
-        fig.add_annotation(x=x1, y=zone_hi, text=f'{zone_label} pullback zone ({zone_dir})',
-                            showarrow=False, xanchor='right', yanchor='bottom',
-                            font=dict(size=10, color=line_color))
+        seg = 12  # future bars per zone segment; segments sit side by side so overlapping fills don't blend into a muddy color
+        for idx, (zone_dir, zone_label) in enumerate(zones):
+            color = 'rgba(34,197,94,0.16)' if zone_dir == 'LONG' else 'rgba(239,68,68,0.16)'
+            line_color = '#22c55e' if zone_dir == 'LONG' else '#ef4444'
+            x0 = chart.index[-1] + step*seg*idx
+            x1 = chart.index[-1] + step*seg*(idx+1)
+            fig.add_shape(type='rect', xref='x', yref='y', x0=x0, x1=x1, y0=zone_lo, y1=zone_hi,
+                          fillcolor=color, line=dict(width=1, color=line_color, dash='dot'), layer='below')
+            fig.add_annotation(x=x1, y=zone_hi, text=f'{zone_label} ({zone_dir})',
+                                showarrow=False, xanchor='right', yanchor='bottom',
+                                font=dict(size=10, color=line_color))
 fig.update_layout(height=520,xaxis_rangeslider_visible=False,margin=dict(l=10,r=10,t=30,b=10)); st.plotly_chart(fig,use_container_width=True)
 if show_zone:
-    st.caption('โซนสีคือช่วงราคาที่คาดว่าจะเป็น pullback เข้า EMA20 (±0.75×ATR ของกราฟนี้) ยื่นไปข้างหน้าไว้ให้เตรียมดู — เป็นการประมาณเชิงภาพเท่านั้น ไม่ใช่ระดับ SL/TP หรือคำสั่งซื้อขายจริง และยังต้องรอ M15 setup + M5 trigger ยืนยันตามเดิม')
+    st.caption('โซนสีคือช่วงราคาที่คาดว่าจะเป็น pullback เข้า EMA20 (±0.75×ATR ของกราฟนี้) ยื่นไปข้างหน้าไว้ให้เตรียมดู — ถ้าทั้ง Short Hold และ Long Hold กำลังรอ pullback พร้อมกัน (เช่น คนละทิศทาง) จะเห็นโซนเขียว/แดงเรียงต่อกัน เป็นการประมาณเชิงภาพเท่านั้น ไม่ใช่ระดับ SL/TP หรือคำสั่งซื้อขายจริง และยังต้องรอ M15 setup + M5 trigger ยืนยันตามเดิม')
 if show_signals:
     st.caption('จุด BUY/SELL คือสัญญาณจากรูปแบบแท่งเทียนของไทม์เฟรมนี้เท่านั้น (ดูอย่างเดียว ไม่ส่งคำสั่งจริง) — ไม่ได้กรองด้วย Macro/Tactical เหมือนการ์ด "สถานะการเทรด" ด้านบน ดังนั้นอาจมีจุดที่สวนทางกับ Short/Long Hold ได้')
 
