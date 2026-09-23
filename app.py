@@ -307,10 +307,15 @@ def scan_signals(d, threshold=55):
     trigger using the same per-bar scoring rules as m5_trigger. Unlike the
     Short Hold / Long Hold cards above, this does NOT check macro/tactical
     alignment or place any order — it just marks where the raw candle
-    pattern fired on this timeframe, similar to a signal-marker chart."""
+    pattern fired on this timeframe, similar to a signal-marker chart.
+    Only the first bar of a new BUY/SELL run is marked (edge-triggered);
+    a sustained trend that keeps scoring above threshold every bar would
+    otherwise produce a solid wall of overlapping arrows instead of
+    discrete, readable signal points."""
     buys, sells = [], []
     if d is None or len(d) < 2:
         return buys, sells
+    last_state = None
     for i in range(1, len(d)):
         x, p = d.iloc[i], d.iloc[i-1]
         rg = max(float(x.range), 1e-9)
@@ -323,10 +328,17 @@ def scan_signals(d, threshold=55):
         bear_reject=x.upper_wick>=0.20*rg and x.close<x.open and x.close<=x.high-0.55*rg
         long_score=min(100, 40*int(bull_break)+35*int(bull_reclaim)+25*int(bull_reject)+10*int(vr>=1.0)+20*int(x.close>x.EMA20))
         short_score=min(100, 40*int(bear_break)+35*int(bear_reclaim)+25*int(bear_reject)+10*int(vr>=1.0)+20*int(x.close<x.EMA20))
-        if long_score>=threshold:
+        if long_score>=threshold and long_score>=short_score:
+            state='LONG'
+        elif short_score>=threshold:
+            state='SHORT'
+        else:
+            state=None
+        if state=='LONG' and last_state!='LONG':
             buys.append({'time': x.name, 'price': float(x.low), 'score': int(long_score)})
-        if short_score>=threshold:
+        elif state=='SHORT' and last_state!='SHORT':
             sells.append({'time': x.name, 'price': float(x.high), 'score': int(short_score)})
+        last_state = state
     return buys, sells
 
 
