@@ -302,20 +302,26 @@ def m5_trigger(d, direction):
     return {'ok':False,'score':int(score),'name':'รอ M5 กลับขึ้น' if direction=='LONG' else 'รอ M5 กลับลง','type':'NONE'}
 
 
-def scan_signals(d, threshold=55):
+def scan_signals(d, threshold=55, min_gap=4):
     """View-only chart overlay: scan every closed bar in d for a BUY/SELL
     trigger using the same per-bar scoring rules as m5_trigger. Unlike the
     Short Hold / Long Hold cards above, this does NOT check macro/tactical
     alignment or place any order — it just marks where the raw candle
     pattern fired on this timeframe, similar to a signal-marker chart.
-    Only the first bar of a new BUY/SELL run is marked (edge-triggered);
-    a sustained trend that keeps scoring above threshold every bar would
-    otherwise produce a solid wall of overlapping arrows instead of
-    discrete, readable signal points."""
+    Two things keep this readable instead of a wall of arrows:
+      1. Edge-triggered: only the first bar of a new BUY/SELL run is marked,
+         so a sustained trend that keeps scoring above threshold every bar
+         doesn't get one arrow per bar.
+      2. Minimum bar spacing (min_gap): even when the state keeps flipping
+         bar-to-bar (typical in a choppy stretch where price oscillates
+         around EMA20), markers are throttled to at most one per min_gap
+         bars, rather than firing on every flip.
+    """
     buys, sells = [], []
     if d is None or len(d) < 2:
         return buys, sells
     last_state = None
+    last_marker_i = -10**9
     for i in range(1, len(d)):
         x, p = d.iloc[i], d.iloc[i-1]
         rg = max(float(x.range), 1e-9)
@@ -334,10 +340,11 @@ def scan_signals(d, threshold=55):
             state='SHORT'
         else:
             state=None
-        if state=='LONG' and last_state!='LONG':
-            buys.append({'time': x.name, 'price': float(x.low), 'score': int(long_score)})
-        elif state=='SHORT' and last_state!='SHORT':
-            sells.append({'time': x.name, 'price': float(x.high), 'score': int(short_score)})
+        ready = (i - last_marker_i) >= min_gap
+        if state=='LONG' and last_state!='LONG' and ready:
+            buys.append({'time': x.name, 'price': float(x.low), 'score': int(long_score)}); last_marker_i=i
+        elif state=='SHORT' and last_state!='SHORT' and ready:
+            sells.append({'time': x.name, 'price': float(x.high), 'score': int(short_score)}); last_marker_i=i
         last_state = state
     return buys, sells
 
@@ -552,6 +559,10 @@ with st.sidebar:
     show_signals = st.checkbox('แสดงจุด BUY/SELL บนกราฟ (ย้อนหลัง)', True,
                                 help='มาร์กเกอร์ดูสัญญาณเฉยๆ ไม่ได้ส่งคำสั่งจริง และไม่ได้กรองด้วย Macro/Tactical เหมือนการ์ดสถานะการเทรด')
     signal_threshold = st.slider('เกณฑ์คะแนนสัญญาณ (ยิ่งสูงยิ่งเข้ม)', 40, 90, 55, 5) if show_signals else 55
+    signal_gap = st.slider('ระยะห่างขั้นต่ำระหว่างจุดสัญญาณ (แท่ง)', 1, 10, 4, 1,
+                            help='ค่ายิ่งสูง ยิ่งลดจุดสัญญาณถี่ๆ ในช่วงตลาด sideway/แกว่งรอบ EMA20') if show_signals else 4
+    show_zone = st.checkbox('แสดงโซน pullback ที่คาดว่าจะเป็นจุดเข้าถัดไป', True,
+                             help='กรอบราคาแนวโน้มรอบ EMA20 ของกราฟนี้ ยื่นไปข้างหน้า — เป็นการประมาณ ไม่ใช่ระดับ SL/TP หรือคำสั่งจริง')
     st.divider()
     st.caption(f'API: Twelve Data • cache {CACHE_TTL}s • โหลดต่อครั้ง 5 คำขอ (ไม่มีคำขอซ้ำสำหรับกราฟ)')
     st.caption('ออกแบบให้ประหยัด API credit สำหรับ free-plan key: คำขอถูกหน่วงเวลา, cache ยาวขึ้น, และมี fallback ไปใช้ข้อมูลล่าสุดที่ดึงสำเร็จเมื่อคำขอถูก rate-limit')
@@ -605,6 +616,7 @@ if have_all:
     with a: render_card(short, 'Short Hold')
     with b: render_card(long, 'Long Hold')
 else:
+    short = long = None
     st.info('ข้อมูลบางไทม์เฟรมยังไม่พร้อม (rate-limit/ไม่มีข้อมูลแคชสำรอง) — รออีกสักครู่แล้วรีเฟรชใหม่')
 
 st.markdown('## โครงสร้างตลาด')
@@ -622,7 +634,7 @@ st.markdown(f'## กราฟ {chart_tf}')
 fig=go.Figure(); fig.add_trace(go.Candlestick(x=chart.index,open=chart.open,high=chart.high,low=chart.low,close=chart.close,name='Price'))
 for n in (20,50,200): fig.add_trace(go.Scatter(x=chart.index,y=chart[f'EMA{n}'],name=f'EMA{n}',mode='lines'))
 if show_signals and not chart.empty:
-    buys, sells = scan_signals(chart, signal_threshold)
+    buys, sells = scan_signals(chart, signal_threshold, signal_gap)
     if buys:
         fig.add_trace(go.Scatter(
             x=[b['time'] for b in buys], y=[b['price'] for b in buys], mode='markers', name='BUY',
@@ -633,7 +645,35 @@ if show_signals and not chart.empty:
             x=[s['time'] for s in sells], y=[s['price'] for s in sells], mode='markers', name='SELL',
             marker=dict(symbol='triangle-down', size=11, color='#ef4444', line=dict(width=1, color='#ffffff')),
             text=[f"SELL {s['score']}%" for s in sells], hovertemplate='%{text}<br>%{y}<extra></extra>'))
+if show_zone and not chart.empty and len(chart) > 20:
+    # Pick which mode's direction to project: prefer whichever is actively
+    # waiting to enter (PRE-ENTRY — literally "watching for the next pullback
+    # entry"), then fall back to whichever has a live direction at all.
+    zone_dir, zone_label = None, None
+    for res, label in ((short, 'Short Hold'), (long, 'Long Hold')):
+        if res and res['status'] == 'PRE-ENTRY' and res['direction'] in ('LONG','SHORT'):
+            zone_dir, zone_label = res['direction'], label; break
+    if zone_dir is None:
+        for res, label in ((short, 'Short Hold'), (long, 'Long Hold')):
+            if res and res['direction'] in ('LONG','SHORT'):
+                zone_dir, zone_label = res['direction'], label; break
+    last = chart.iloc[-1]
+    ema20_last, atr_last = float(last.EMA20), float(last.ATR)
+    if zone_dir and np.isfinite(ema20_last) and np.isfinite(atr_last) and atr_last > 0:
+        zone_lo, zone_hi = ema20_last - 0.75*atr_last, ema20_last + 0.75*atr_last
+        color = 'rgba(34,197,94,0.16)' if zone_dir == 'LONG' else 'rgba(239,68,68,0.16)'
+        line_color = '#22c55e' if zone_dir == 'LONG' else '#ef4444'
+        deltas = chart.index.to_series().diff().dropna()
+        step = deltas.median() if len(deltas) else pd.Timedelta(minutes=15)
+        x0, x1 = chart.index[-1], chart.index[-1] + step*15
+        fig.add_shape(type='rect', xref='x', yref='y', x0=x0, x1=x1, y0=zone_lo, y1=zone_hi,
+                      fillcolor=color, line=dict(width=1, color=line_color, dash='dot'), layer='below')
+        fig.add_annotation(x=x1, y=zone_hi, text=f'{zone_label} pullback zone ({zone_dir})',
+                            showarrow=False, xanchor='right', yanchor='bottom',
+                            font=dict(size=10, color=line_color))
 fig.update_layout(height=520,xaxis_rangeslider_visible=False,margin=dict(l=10,r=10,t=30,b=10)); st.plotly_chart(fig,use_container_width=True)
+if show_zone:
+    st.caption('โซนสีคือช่วงราคาที่คาดว่าจะเป็น pullback เข้า EMA20 (±0.75×ATR ของกราฟนี้) ยื่นไปข้างหน้าไว้ให้เตรียมดู — เป็นการประมาณเชิงภาพเท่านั้น ไม่ใช่ระดับ SL/TP หรือคำสั่งซื้อขายจริง และยังต้องรอ M15 setup + M5 trigger ยืนยันตามเดิม')
 if show_signals:
     st.caption('จุด BUY/SELL คือสัญญาณจากรูปแบบแท่งเทียนของไทม์เฟรมนี้เท่านั้น (ดูอย่างเดียว ไม่ส่งคำสั่งจริง) — ไม่ได้กรองด้วย Macro/Tactical เหมือนการ์ด "สถานะการเทรด" ด้านบน ดังนั้นอาจมีจุดที่สวนทางกับ Short/Long Hold ได้')
 
