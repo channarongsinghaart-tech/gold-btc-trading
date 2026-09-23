@@ -273,6 +273,28 @@ if show_signals:
     buys,sells=scan_signals(chart,signal_threshold,signal_gap)
     if buys:fig.add_trace(go.Scatter(x=[x['time'] for x in buys],y=[x['price'] for x in buys],mode='markers',name='BUY',marker=dict(symbol='triangle-up',size=11,color='#22c55e'),text=[f"BUY {x['score']}%" for x in buys],hovertemplate='%{text}<br>%{y}<extra></extra>'))
     if sells:fig.add_trace(go.Scatter(x=[x['time'] for x in sells],y=[x['price'] for x in sells],mode='markers',name='SELL',marker=dict(symbol='triangle-down',size=11,color='#ef4444'),text=[f"SELL {x['score']}%" for x in sells],hovertemplate='%{text}<br>%{y}<extra></extra>'))
+# Trade plan lines: only show Entry/SL/TP when the decision card has an actual ENTRY READY plan.
+# The green/red pullback box remains a zone; it is not itself an order level.
+if short or long:
+    plans=[]
+    if short and short.get('status')=='ENTRY READY' and short.get('plan'):
+        plans.append(('Short Hold', short['direction'], short['plan']))
+    if long and long.get('status')=='ENTRY READY' and long.get('plan'):
+        plans.append(('Long Hold', long['direction'], long['plan']))
+    for label,direction,p in plans:
+        line_color = '#22c55e' if direction=='LONG' else '#ef4444'
+        x_start = chart.index[0]
+        x_end = chart.index[-1] + (chart.index.to_series().diff().dropna().median() if len(chart)>1 else pd.Timedelta(minutes=15))*12
+        levels = [
+            ('ENTRY', float(p['entry']), line_color, 'solid'),
+            ('SL', float(p['sl']), '#ff7f0e', 'dash'),
+            ('TP1', float(p['tp1']), '#3b82f6', 'dash'),
+            ('TP2', float(p['tp2']), '#a855f7', 'dash'),
+        ]
+        for name,level,color,dash in levels:
+            fig.add_shape(type='line',xref='x',yref='y',x0=x_start,x1=x_end,y0=level,y1=level,line=dict(color=color,width=2,dash=dash),layer='above')
+            fig.add_annotation(x=x_end,y=level,text=f'{label} {name} {fmt(level)}',showarrow=False,xanchor='right',yanchor='middle',font=dict(size=10,color=color),bgcolor='rgba(15,15,20,0.75)',borderpad=2)
+
 if show_zone and len(chart)>20 and short and long:
     zones=[]
     for res,label in ((short,'Short Hold'),(long,'Long Hold')):
@@ -286,4 +308,6 @@ if show_zone and len(chart)>20 and short and long:
             x0=chart.index[-1]+step*12*i;x1=chart.index[-1]+step*12*(i+1); lc='#22c55e' if zd=='LONG' else '#ef4444'; fc='rgba(34,197,94,0.16)' if zd=='LONG' else 'rgba(239,68,68,0.16)'; fig.add_shape(type='rect',xref='x',yref='y',x0=x0,x1=x1,y0=e-.75*atr,y1=e+.75*atr,fillcolor=fc,line=dict(width=1,color=lc,dash='dot'),layer='below');fig.add_annotation(x=x1,y=e+.75*atr,text=f'{zl} ({zd})',showarrow=False,xanchor='right',yanchor='bottom',font=dict(size=10,color=lc))
 fig.update_layout(height=520,xaxis_rangeslider_visible=False,margin=dict(l=10,r=10,t=30,b=10));st.plotly_chart(fig,use_container_width=True)
 if show_signals:st.caption('BUY/SELL บนกราฟเป็น raw candle markers เท่านั้น ไม่ได้ผ่าน Macro/Tactical gate และไม่ส่งคำสั่งจริง')
+if short or long:
+    st.caption('กรอบเขียว/แดง = Entry Zone สำหรับเฝ้ารอ ไม่ใช่คำสั่งเข้าอัตโนมัติ • เส้น ENTRY/SL/TP1/TP2 จะขึ้นเมื่อระบบได้ ENTRY READY เท่านั้น')
 st.markdown('## หลักการของ V4.7');st.write('Trend-following only: D1/H4/H1/M15 ต้อง align กันก่อน ENTRY READY และ Macro Strength ต้อง ≥60. M15 เป็น setup และ M5 เป็น trigger. M5 trigger ใช้เฉพาะ breakout/reclaim/rejection points; ไม่มีคะแนนฟรีจาก volume หรือ EMA. Short Hold ไม่มี COUNTER-MACRO ENTRY. Long Hold ที่ TF ย่อยยังไม่ align จะแสดง PULLBACK / RESUME และยังไม่เป็น ENTRY READY. ระบบเป็น analyzer ไม่ส่งคำสั่งซื้อขายอัตโนมัติ')
