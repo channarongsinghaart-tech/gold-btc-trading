@@ -152,7 +152,7 @@ def scan_signals(d,threshold=55,min_gap=4):
     for i in range(1,len(d)):
         x,p=d.iloc[i],d.iloc[i-1]; rg=max(float(x.range),1e-9)
         bb=x.close>p.high and x.close>x.open and x.body_ratio>=.20; bd=x.close<p.low and x.close<x.open and x.body_ratio>=.20; br=x.close>x.EMA20 and p.close<=p.EMA20 and x.close>x.open; sr=x.close<x.EMA20 and p.close>=p.EMA20 and x.close<x.open; bj=x.lower_wick>=.20*rg and x.close>x.open and x.close>=x.low+.55*rg; sj=x.upper_wick>=.20*rg and x.close<x.open and x.close<=x.high-.55*rg
-        ls=min(100,40*int(bb)+35*int(br)+25*int(bj)+10*int(np.isfinite(x.VolRatio) and x.VolRatio>=1)+20*int(x.close>x.EMA20)); ss=min(100,40*int(bd)+35*int(sr)+25*int(sj)+10*int(np.isfinite(x.VolRatio) and x.VolRatio>=1)+20*int(x.close<x.EMA20))
+        ls=min(100,40*int(bb)+35*int(br)+25*int(bj)); ss=min(100,40*int(bd)+35*int(sr)+25*int(sj))
         state='LONG' if ls>=threshold and ls>=ss else 'SHORT' if ss>=threshold else None
         if i-last_i>=min_gap:
             if state=='LONG' and last_state!='LONG':buys.append({'time':x.name,'price':float(x.low),'score':int(ls)});last_i=i
@@ -204,7 +204,7 @@ def evaluate(frames,mode):
         direction,setup,trig,loc=short_dir,short_setup,short_trig,short_loc
         if macro=='NEUTRAL':status='WAIT';entry_class='WAIT';reason='D1/H4 ยังไม่ให้ Macro direction'
         elif ctx['macro_strength']<MIN_MACRO_SCORE:status='WAIT';entry_class='WAIT';reason=f'Macro Strength {ctx["macro_strength"]}/100 ต่ำกว่าเกณฑ์ {MIN_MACRO_SCORE} — รอ Macro แข็งแรงขึ้น'
-        elif not full_align:status='PRE-ENTRY';entry_class='TREND WATCH';reason=f'Macro {macro} แต่ D1/H4/H1/M15 ยังไม่ align ครบ — รอทุก TF กลับ {macro}'
+        elif not full_align:status='PRE-ENTRY' if (setup['ok'] or setup['near']) else 'WAIT';entry_class='PULLBACK / RESUME';reason=f'Macro {macro} • Tactical {tactical} • รอ D1/H4/H1/M15 align และ M5 trigger • {setup["name"]} • {trig["name"]}'
         elif setup['ok'] and trig['ok']:status='ENTRY READY';entry_class='TREND ENTRY';reason=f'Trend aligned • {setup["name"]} • {trig["name"]} • {loc["zone"]}'
         elif setup['ok'] or setup['near']:status='PRE-ENTRY';entry_class='TREND WATCH';reason=f'{setup["name"]} • {trig["name"]} • {loc["reason"]}'
         else:status='WAIT';entry_class='WAIT';reason=setup['name']
