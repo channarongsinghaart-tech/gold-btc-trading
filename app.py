@@ -224,7 +224,18 @@ def evaluate(frames,mode):
 
 def fmt(v):return '—' if v is None or not np.isfinite(v) else f'{v:,.2f}'
 
-def render_card(r,title):
+CONTRACT_SIZE={'BTC/USD':1.0,'XAU/USD':100.0}  # units per 1.00 lot (checked against broker history: XAU 100 oz, BTC 1 BTC)
+def position_size(balance,risk_pct,entry,sl,contract,step=0.01):
+    """Lot size so that hitting SL loses ~risk_pct of balance. Rounds DOWN to the lot step, never up."""
+    dist=abs(entry-sl)
+    if balance<=0 or risk_pct<=0 or dist<=0 or contract<=0:return None
+    target=balance*risk_pct/100.0
+    raw=target/(dist*contract)
+    lot=float(np.floor(raw/step+1e-9)*step)
+    min_lot_risk=step*dist*contract
+    return {'lot':round(lot,2),'target_risk':target,'dist':dist,'min_lot_risk':min_lot_risk,'too_small':lot<step,'risk_usd':lot*dist*contract}
+
+def render_card(r,title,sizing=None):
     ready=r['status']=='ENTRY READY'; pre=r['status']=='PRE-ENTRY'; icon='🟢' if ready and r['direction']=='LONG' else '🔴' if ready and r['direction']=='SHORT' else '🟡'
     st.markdown(f'### {title}'); st.markdown(f'**{icon} {r["status"]} — {r["direction"]}**')
     if r['entry_class']=='PULLBACK / RESUME':st.info('PULLBACK / RESUME — Macro กับ Tactical/TF ย่อยยังไม่ align ครบ จึงยังไม่ถือเป็น entry')
@@ -234,6 +245,14 @@ def render_card(r,title):
     st.info(('PRE-ENTRY: ' if pre else 'ENTRY READY: ' if ready else 'WAIT: ')+r['reason'])
     if ready and r['plan']:
         p=r['plan']; a,b,c,d=st.columns(4); a.metric('Entry',fmt(p['entry'])); b.metric('SL',fmt(p['sl'])); c.metric('TP1',fmt(p['tp1'])); d.metric('TP2',fmt(p['tp2'])); st.caption(f'R:R to TP2 ≈ {p["rr"]:.2f}R')
+        if sizing:
+            ps=position_size(sizing['balance'],sizing['risk_pct'],p['entry'],p['sl'],sizing['contract'])
+            if ps is None:st.caption('คำนวณล็อตไม่ได้ — ตรวจยอดพอร์ต/ความเสี่ยงในแถบตั้งค่า')
+            elif ps['too_small']:
+                st.warning(f"ล็อตต่ำสุด 0.01 ก็เสี่ยงราว ${ps['min_lot_risk']:.2f} ซึ่งเกินเป้า ${ps['target_risk']:.2f} ({sizing['risk_pct']:g}% ของพอร์ต) — ควรข้ามไม้นี้ อย่าฝืนเข้าด้วยล็อตที่ใหญ่กว่าที่คำนวณได้")
+            else:
+                l1,l2,l3=st.columns(3); l1.metric('ล็อตที่เหมาะสม',f"{ps['lot']:.2f}"); l2.metric('เสียถ้าโดน SL',f"-${ps['risk_usd']:.2f}"); l3.metric('ได้ถ้าถึง TP2',f"+${ps['lot']*abs(p['tp2']-p['entry'])*sizing['contract']:.2f}")
+                st.caption(f"ยึดความเสี่ยง {sizing['risk_pct']:g}% ของพอร์ต ${sizing['balance']:,.0f} • 1 สัญญาณ = 1 ไม้ ห้ามเพิ่มไม้ทับขณะติดลบ • ปิดครึ่งที่ TP1 แล้วเลื่อน SL มาที่ราคาเข้า")
     else:st.caption('ยังไม่แสดง Entry / SL / TP จนกว่าจะเกิด ENTRY READY')
 
 st.title('Gold & Bitcoin Trading Analyzer — V4.7')
@@ -242,6 +261,9 @@ with st.sidebar:
     st.header('ตั้งค่าการวิเคราะห์'); asset_name=st.selectbox('สินทรัพย์',list(ASSETS.keys()),index=0); symbol=ASSETS[asset_name]; chart_tf=st.selectbox('Timeframe กราฟ',list(TF.keys()),index=1); outputsize=st.slider('จำนวนแท่ง',250,800,400,50); auto=st.checkbox('Auto refresh',False); refresh=st.slider('รอบรีเฟรช (วินาที)',60,300,90,10)
     if st.button('รีเฟรชข้อมูลตอนนี้'):st.cache_data.clear();st.rerun()
     st.divider(); show_signals=st.checkbox('แสดงจุด BUY/SELL บนกราฟ (ย้อนหลัง)',True); signal_threshold=st.slider('เกณฑ์คะแนนสัญญาณ',40,90,55,5) if show_signals else 55; signal_gap=st.slider('ระยะห่างขั้นต่ำระหว่างจุดสัญญาณ (แท่ง)',1,10,4,1) if show_signals else 4; show_zone=st.checkbox('แสดงโซน pullback',True); st.caption(f'API: Twelve Data • cache {CACHE_TTL}s • 5 requests/load')
+    st.divider(); st.subheader('คำนวณล็อต'); use_sizing=st.checkbox('แสดงล็อตที่เหมาะสมในการ์ด ENTRY READY',True)
+    account_balance=st.number_input('ยอดพอร์ต (USD)',min_value=0.0,value=1000.0,step=100.0) if use_sizing else 0.0
+    risk_pct=st.slider('ความเสี่ยงต่อไม้ (% ของพอร์ต)',0.25,3.0,1.0,0.25,help='มืออาชีพส่วนใหญ่ใช้ราว 0.5–2% ต่อไม้ — ยิ่งต่ำ พอร์ตยิ่งทนช่วงแพ้ติดกันได้') if use_sizing else 1.0
 if auto:st.markdown(f'<meta http-equiv="refresh" content="{refresh}">',unsafe_allow_html=True)
 frames,raws,errors,stale={},{},{},{}
 for label in ['1D','4h','1h','15m','5m']:
@@ -258,8 +280,11 @@ short=long=None
 st.markdown('## สถานะการเทรด')
 if have_all:
     short=evaluate(frames,'Short Hold');long=evaluate(frames,'Long Hold');a,b=st.columns(2)
-    with a:render_card(short,'Short Hold')
-    with b:render_card(long,'Long Hold')
+    sizing={'balance':account_balance,'risk_pct':risk_pct,'contract':CONTRACT_SIZE.get(symbol,1.0)} if use_sizing else None
+    with a:render_card(short,'Short Hold',sizing)
+    with b:render_card(long,'Long Hold',sizing)
+    if use_sizing and short['status']=='ENTRY READY' and long['status']=='ENTRY READY' and short['plan'] and long['plan']:
+        st.warning(f"⚠️ ทั้งสองโหมดพร้อมเข้าพร้อมกัน = ทิศทางเดียวกัน ถ้าเปิดทั้งคู่ ความเสี่ยงรวมจะเป็น {2*risk_pct:g}% ของพอร์ต — เลือกโหมดเดียว หรือแบ่งความเสี่ยงคนละครึ่ง")
 else:st.info('ข้อมูลบางไทม์เฟรมยังไม่พร้อม — รอแล้วรีเฟรชใหม่')
 st.markdown('## โครงสร้างตลาด'); rows=[]
 for tf in ['1D','4h','1h','15m','5m']:
