@@ -14,8 +14,12 @@ CACHE_TTL=60
 _last_call_ts=0.0
 _LAST_GOOD={}
 API_KEY=os.getenv('TWELVEDATA_API_KEY','')
+LINE_TOKEN_DEFAULT=os.getenv('LINE_CHANNEL_ACCESS_TOKEN','')
+LINE_USER_ID_DEFAULT=os.getenv('LINE_USER_ID','')
 try:
     if not API_KEY and 'TWELVEDATA_API_KEY' in st.secrets: API_KEY=str(st.secrets['TWELVEDATA_API_KEY'])
+    if not LINE_TOKEN_DEFAULT and 'LINE_CHANNEL_ACCESS_TOKEN' in st.secrets: LINE_TOKEN_DEFAULT=str(st.secrets['LINE_CHANNEL_ACCESS_TOKEN'])
+    if not LINE_USER_ID_DEFAULT and 'LINE_USER_ID' in st.secrets: LINE_USER_ID_DEFAULT=str(st.secrets['LINE_USER_ID'])
 except Exception: pass
 
 def _pace_requests():
@@ -296,9 +300,9 @@ with st.sidebar:
     account_balance=st.number_input('ยอดพอร์ต (USD)',min_value=0.0,value=1000.0,step=100.0) if use_sizing else 0.0
     risk_pct=st.slider('ความเสี่ยงต่อไม้ (% ของพอร์ต)',0.25,3.0,1.0,0.25,help='มืออาชีพส่วนใหญ่ใช้ราว 0.5–2% ต่อไม้ — ยิ่งต่ำ พอร์ตยิ่งทนช่วงแพ้ติดกันได้') if use_sizing else 1.0
     st.divider(); st.subheader('แจ้งเตือนเข้า LINE')
-    line_enabled=st.checkbox('เปิดแจ้งเตือนเมื่อ ENTRY READY',False)
-    line_token=st.text_input('LINE Channel Access Token',type='password',help='จาก LINE Developers Console > แชนแนล Messaging API ของคุณ > Issue token') if line_enabled else ''
-    line_user_id=st.text_input('LINE User ID',help='ถ้าใส่ไว้ จะส่งแบบ push ตรงถึงคุณคนเดียว (แนะนำ) ถ้าเว้นว่างจะ broadcast ถึงทุกคนที่แอด OA นี้') if line_enabled else ''
+    line_enabled=st.checkbox('เปิดแจ้งเตือนเมื่อ ENTRY READY',bool(LINE_TOKEN_DEFAULT))
+    line_token=st.text_input('LINE Channel Access Token',value=LINE_TOKEN_DEFAULT,type='password',help='ตั้งไว้ใน Streamlit Secrets แล้วจะขึ้นให้อัตโนมัติ') if line_enabled else ''
+    line_user_id=st.text_input('LINE User ID',value=LINE_USER_ID_DEFAULT,help='ถ้าใส่ไว้ จะส่งแบบ push ตรงถึงคุณคนเดียว (แนะนำ) ถ้าเว้นว่างจะ broadcast ถึงทุกคนที่แอด OA นี้') if line_enabled else ''
     if line_enabled:st.caption('ต้องเปิดแท็บนี้ค้างไว้พร้อม Auto refresh ถึงจะเช็คสัญญาณใหม่ได้ต่อเนื่อง • แผนฟรี LINE OA ส่งได้ราว 200 ข้อความ/เดือน')
 if auto:st.markdown(f'<meta http-equiv="refresh" content="{refresh}">',unsafe_allow_html=True)
 frames,raws,errors,stale={},{},{},{}
