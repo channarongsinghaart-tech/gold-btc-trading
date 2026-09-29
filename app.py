@@ -18,90 +18,6 @@ try:
     if not API_KEY and 'TWELVEDATA_API_KEY' in st.secrets: API_KEY=str(st.secrets['TWELVEDATA_API_KEY'])
 except Exception: pass
 
-# LINE Messaging API (push to ONE exact user only; never broadcast)
-LINE_TOKEN='2eaa3e7096d9f4035d674ee0683f320d'
-LINE_USER_ID='U3d78e626c70085bcd9da189d9f77abfc'
-try:
-    if 'LINE_CHANNEL_ACCESS_TOKEN' in st.secrets:
-        LINE_TOKEN=str(st.secrets['LINE_CHANNEL_ACCESS_TOKEN'])
-    if 'LINE_USER_ID' in st.secrets:
-        LINE_USER_ID=str(st.secrets['LINE_USER_ID'])
-except Exception:
-    pass
-LINE_PUSH_URL='https://api.line.me/v2/bot/message/push'
-
-
-def line_push(text):
-    """Send a push message only to the configured LINE_USER_ID."""
-    if not LINE_TOKEN or not LINE_USER_ID:
-        return False, 'ยังไม่ได้ตั้ง LINE_CHANNEL_ACCESS_TOKEN หรือ LINE_USER_ID ใน Streamlit Secrets'
-    try:
-        r=requests.post(
-            LINE_PUSH_URL,
-            headers={
-                'Authorization': f'Bearer {LINE_TOKEN}',
-                'Content-Type': 'application/json',
-            },
-            json={
-                'to': LINE_USER_ID,
-                'messages': [{'type':'text','text':text}],
-            },
-            timeout=20,
-        )
-        if r.status_code == 200:
-            return True, 'ส่ง LINE Push สำเร็จ'
-        try:
-            detail=r.json().get('message',r.text)
-        except Exception:
-            detail=r.text
-        return False, f'LINE Push error {r.status_code}: {detail}'
-    except Exception as e:
-        return False, f'LINE Push เชื่อมต่อไม่สำเร็จ: {e}'
-
-
-def build_line_entry_alert(asset_name, candle_time, results):
-    lines=[f'🚨 V4.7 ENTRY READY', asset_name, f'5m candle: {candle_time}', '']
-    for title,r in results:
-        p=r.get('plan') or {}
-        lines += [
-            f'【{title}】 {r["direction"]}',
-            f'Entry: {fmt(p.get("entry"))}',
-            f'SL: {fmt(p.get("sl"))}',
-            f'TP1: {fmt(p.get("tp1"))}',
-            f'TP2: {fmt(p.get("tp2"))}',
-            f'R:R TP2: {p.get("rr",0):.2f}R',
-            f'Macro: {r["macro"]} {r["macro_strength"]}/100',
-            f'Tactical: {r["tactical"]} {r["tactical_strength"]}/100',
-            f'M15: {r["setup"]["name"]}',
-            f'M5: {r["trigger"]["name"]}',
-            ''
-        ]
-    lines.append('แจ้งเตือนนี้ส่งแบบ Push ไปยัง LINE_USER_ID ที่ตั้งไว้เท่านั้น')
-    return '\n'.join(lines)
-
-
-def maybe_send_line_entry_alert(asset_name, frames, results):
-    ready=[(title,r) for title,r in results if r and r.get('status')=='ENTRY READY' and r.get('plan')]
-    if not ready or '5m' not in frames or frames['5m'].empty:
-        return None
-    candle_time=str(frames['5m'].index[-1])
-    key_parts=[asset_name,candle_time]
-    for title,r in ready:
-        p=r['plan']
-        key_parts += [title,r['direction'],f'{p["entry"]:.5f}',f'{p["sl"]:.5f}',f'{p["tp1"]:.5f}',f'{p["tp2"]:.5f}']
-    key='|'.join(key_parts)
-    sent_keys=st.session_state.setdefault('line_alert_keys',set())
-    if key in sent_keys:
-        return None
-    msg=build_line_entry_alert(asset_name,candle_time,ready)
-    ok,detail=line_push(msg)
-    if ok:
-        sent_keys.add(key)
-    return ok,detail
-
-
-def fmt(v):return '—' if v is None or not np.isfinite(v) else f'{v:,.2f}'
-
 def _pace_requests():
     global _last_call_ts
     wait=MIN_CALL_INTERVAL-(time.monotonic()-_last_call_ts)
@@ -236,7 +152,7 @@ def scan_signals(d,threshold=55,min_gap=4):
     for i in range(1,len(d)):
         x,p=d.iloc[i],d.iloc[i-1]; rg=max(float(x.range),1e-9)
         bb=x.close>p.high and x.close>x.open and x.body_ratio>=.20; bd=x.close<p.low and x.close<x.open and x.body_ratio>=.20; br=x.close>x.EMA20 and p.close<=p.EMA20 and x.close>x.open; sr=x.close<x.EMA20 and p.close>=p.EMA20 and x.close<x.open; bj=x.lower_wick>=.20*rg and x.close>x.open and x.close>=x.low+.55*rg; sj=x.upper_wick>=.20*rg and x.close<x.open and x.close<=x.high-.55*rg
-        ls=min(100,40*int(bb)+35*int(br)+25*int(bj)+10*int(np.isfinite(x.VolRatio) and x.VolRatio>=1)+20*int(x.close>x.EMA20)); ss=min(100,40*int(bd)+35*int(sr)+25*int(sj)+10*int(np.isfinite(x.VolRatio) and x.VolRatio>=1)+20*int(x.close<x.EMA20))
+        ls=min(100,40*int(bb)+35*int(br)+25*int(bj)); ss=min(100,40*int(bd)+35*int(sr)+25*int(sj))
         state='LONG' if ls>=threshold and ls>=ss else 'SHORT' if ss>=threshold else None
         if i-last_i>=min_gap:
             if state=='LONG' and last_state!='LONG':buys.append({'time':x.name,'price':float(x.low),'score':int(ls)});last_i=i
@@ -288,7 +204,7 @@ def evaluate(frames,mode):
         direction,setup,trig,loc=short_dir,short_setup,short_trig,short_loc
         if macro=='NEUTRAL':status='WAIT';entry_class='WAIT';reason='D1/H4 ยังไม่ให้ Macro direction'
         elif ctx['macro_strength']<MIN_MACRO_SCORE:status='WAIT';entry_class='WAIT';reason=f'Macro Strength {ctx["macro_strength"]}/100 ต่ำกว่าเกณฑ์ {MIN_MACRO_SCORE} — รอ Macro แข็งแรงขึ้น'
-        elif not full_align:status='PRE-ENTRY';entry_class='TREND WATCH';reason=f'Macro {macro} แต่ D1/H4/H1/M15 ยังไม่ align ครบ — รอทุก TF กลับ {macro}'
+        elif not full_align:status='PRE-ENTRY' if (setup['ok'] or setup['near']) else 'WAIT';entry_class='PULLBACK / RESUME';reason=f'Macro {macro} • Tactical {tactical} • รอ D1/H4/H1/M15 align และ M5 trigger • {setup["name"]} • {trig["name"]}'
         elif setup['ok'] and trig['ok']:status='ENTRY READY';entry_class='TREND ENTRY';reason=f'Trend aligned • {setup["name"]} • {trig["name"]} • {loc["zone"]}'
         elif setup['ok'] or setup['near']:status='PRE-ENTRY';entry_class='TREND WATCH';reason=f'{setup["name"]} • {trig["name"]} • {loc["reason"]}'
         else:status='WAIT';entry_class='WAIT';reason=setup['name']
@@ -306,7 +222,51 @@ def evaluate(frames,mode):
     relation='ALIGNED' if full_align else 'COUNTER-MACRO' if counter else 'MIXED'
     return {'status':status,'direction':direction,'macro':macro,'tactical':tactical,'macro_strength':ctx['macro_strength'],'tactical_strength':ctx['tactical_strength'],'relation':relation,'entry_class':entry_class,'trend_d1':ctx['d1']['score'],'h4_score':ctx['h4']['score'],'h1_score':ctx['h1']['score'],'alignment':int(round((ctx['h4']['score']+ctx['h1']['score'])/2)),'setup':setup,'trigger':trig,'range':range_info(frames['15m']),'location':loc,'readiness':readiness,'plan':plan,'reason':reason,'states':ctx}
 
-def render_card(r,title):
+def fmt(v):return '—' if v is None or not np.isfinite(v) else f'{v:,.2f}'
+
+CONTRACT_SIZE={'BTC/USD':1.0,'XAU/USD':100.0}  # units per 1.00 lot (checked against broker history: XAU 100 oz, BTC 1 BTC)
+
+_LAST_NOTIFIED={}  # process-level: {(symbol,mode): signature} so the same ENTRY READY isn't broadcast every rerun
+def notify_line(token,message,user_id=None):
+    url='https://api.line.me/v2/bot/message/push' if user_id else 'https://api.line.me/v2/bot/message/broadcast'
+    body={'messages':[{'type':'text','text':message[:4900]}]}
+    if user_id:body['to']=user_id
+    try:
+        r=requests.post(url,headers={'Authorization':f'Bearer {token}','Content-Type':'application/json'},
+                         json=body,timeout=10)
+        if r.status_code==200:return True,None
+        try:msg=r.json().get('message',r.text)
+        except Exception:msg=r.text
+        return False,f'{r.status_code}: {msg}'
+    except Exception as exc:
+        return False,str(exc)
+
+def maybe_notify_entry(token,symbol,mode,r,sizing,user_id=None):
+    if r['status']!='ENTRY READY' or not r['plan']:return None
+    p=r['plan']
+    sig=(symbol,mode,r['direction'],round(p['entry'],2),round(p['sl'],2))
+    key=(symbol,mode)
+    if _LAST_NOTIFIED.get(key)==sig:return None  # already notified this exact signal, skip
+    lines=[f"🔔 {symbol} {mode} — ENTRY READY {r['direction']}",
+           f"Entry {fmt(p['entry'])} | SL {fmt(p['sl'])}",
+           f"TP1 {fmt(p['tp1'])} | TP2 {fmt(p['tp2'])} | R:R {p['rr']:.2f}R"]
+    if sizing and sizing.get('balance',0)>0:
+        ps=position_size(sizing['balance'],sizing['risk_pct'],p['entry'],p['sl'],sizing['contract'])
+        if ps and not ps['too_small']:lines.append(f"ล็อตแนะนำ {ps['lot']:.2f} • เสี่ยง ${ps['risk_usd']:.2f}")
+    ok,err=notify_line(token,'\n'.join(lines),user_id)
+    if ok:_LAST_NOTIFIED[key]=sig
+    return ok,err
+def position_size(balance,risk_pct,entry,sl,contract,step=0.01):
+    """Lot size so that hitting SL loses ~risk_pct of balance. Rounds DOWN to the lot step, never up."""
+    dist=abs(entry-sl)
+    if balance<=0 or risk_pct<=0 or dist<=0 or contract<=0:return None
+    target=balance*risk_pct/100.0
+    raw=target/(dist*contract)
+    lot=float(np.floor(raw/step+1e-9)*step)
+    min_lot_risk=step*dist*contract
+    return {'lot':round(lot,2),'target_risk':target,'dist':dist,'min_lot_risk':min_lot_risk,'too_small':lot<step,'risk_usd':lot*dist*contract}
+
+def render_card(r,title,sizing=None):
     ready=r['status']=='ENTRY READY'; pre=r['status']=='PRE-ENTRY'; icon='🟢' if ready and r['direction']=='LONG' else '🔴' if ready and r['direction']=='SHORT' else '🟡'
     st.markdown(f'### {title}'); st.markdown(f'**{icon} {r["status"]} — {r["direction"]}**')
     if r['entry_class']=='PULLBACK / RESUME':st.info('PULLBACK / RESUME — Macro กับ Tactical/TF ย่อยยังไม่ align ครบ จึงยังไม่ถือเป็น entry')
@@ -316,6 +276,14 @@ def render_card(r,title):
     st.info(('PRE-ENTRY: ' if pre else 'ENTRY READY: ' if ready else 'WAIT: ')+r['reason'])
     if ready and r['plan']:
         p=r['plan']; a,b,c,d=st.columns(4); a.metric('Entry',fmt(p['entry'])); b.metric('SL',fmt(p['sl'])); c.metric('TP1',fmt(p['tp1'])); d.metric('TP2',fmt(p['tp2'])); st.caption(f'R:R to TP2 ≈ {p["rr"]:.2f}R')
+        if sizing:
+            ps=position_size(sizing['balance'],sizing['risk_pct'],p['entry'],p['sl'],sizing['contract'])
+            if ps is None:st.caption('คำนวณล็อตไม่ได้ — ตรวจยอดพอร์ต/ความเสี่ยงในแถบตั้งค่า')
+            elif ps['too_small']:
+                st.warning(f"ล็อตต่ำสุด 0.01 ก็เสี่ยงราว ${ps['min_lot_risk']:.2f} ซึ่งเกินเป้า ${ps['target_risk']:.2f} ({sizing['risk_pct']:g}% ของพอร์ต) — ควรข้ามไม้นี้ อย่าฝืนเข้าด้วยล็อตที่ใหญ่กว่าที่คำนวณได้")
+            else:
+                l1,l2,l3=st.columns(3); l1.metric('ล็อตที่เหมาะสม',f"{ps['lot']:.2f}"); l2.metric('เสียถ้าโดน SL',f"-${ps['risk_usd']:.2f}"); l3.metric('ได้ถ้าถึง TP2',f"+${ps['lot']*abs(p['tp2']-p['entry'])*sizing['contract']:.2f}")
+                st.caption(f"ยึดความเสี่ยง {sizing['risk_pct']:g}% ของพอร์ต ${sizing['balance']:,.0f} • 1 สัญญาณ = 1 ไม้ ห้ามเพิ่มไม้ทับขณะติดลบ • ปิดครึ่งที่ TP1 แล้วเลื่อน SL มาที่ราคาเข้า")
     else:st.caption('ยังไม่แสดง Entry / SL / TP จนกว่าจะเกิด ENTRY READY')
 
 st.title('Gold & Bitcoin Trading Analyzer — V4.7')
@@ -323,12 +291,15 @@ st.caption('D1 trend → H4 → H1 → M15 setup → M5 trigger. Short Hold แ�
 with st.sidebar:
     st.header('ตั้งค่าการวิเคราะห์'); asset_name=st.selectbox('สินทรัพย์',list(ASSETS.keys()),index=0); symbol=ASSETS[asset_name]; chart_tf=st.selectbox('Timeframe กราฟ',list(TF.keys()),index=1); outputsize=st.slider('จำนวนแท่ง',250,800,400,50); auto=st.checkbox('Auto refresh',False); refresh=st.slider('รอบรีเฟรช (วินาที)',60,300,90,10)
     if st.button('รีเฟรชข้อมูลตอนนี้'):st.cache_data.clear();st.rerun()
-    line_ready=bool(LINE_TOKEN and LINE_USER_ID)
-    st.caption('LINE Push: ' + ('พร้อม — ส่งหา User ID นี้เท่านั้น' if line_ready else 'ยังไม่ได้ตั้ง Secrets'))
-    if line_ready and st.button('ทดสอบ LINE Push'):
-        ok,msg=line_push('✅ ทดสอบ LINE Push จาก Gold & Bitcoin Trading Analyzer V4.7 สำเร็จ')
-        st.success(msg) if ok else st.error(msg)
     st.divider(); show_signals=st.checkbox('แสดงจุด BUY/SELL บนกราฟ (ย้อนหลัง)',True); signal_threshold=st.slider('เกณฑ์คะแนนสัญญาณ',40,90,55,5) if show_signals else 55; signal_gap=st.slider('ระยะห่างขั้นต่ำระหว่างจุดสัญญาณ (แท่ง)',1,10,4,1) if show_signals else 4; show_zone=st.checkbox('แสดงโซน pullback',True); st.caption(f'API: Twelve Data • cache {CACHE_TTL}s • 5 requests/load')
+    st.divider(); st.subheader('คำนวณล็อต'); use_sizing=st.checkbox('แสดงล็อตที่เหมาะสมในการ์ด ENTRY READY',True)
+    account_balance=st.number_input('ยอดพอร์ต (USD)',min_value=0.0,value=1000.0,step=100.0) if use_sizing else 0.0
+    risk_pct=st.slider('ความเสี่ยงต่อไม้ (% ของพอร์ต)',0.25,3.0,1.0,0.25,help='มืออาชีพส่วนใหญ่ใช้ราว 0.5–2% ต่อไม้ — ยิ่งต่ำ พอร์ตยิ่งทนช่วงแพ้ติดกันได้') if use_sizing else 1.0
+    st.divider(); st.subheader('แจ้งเตือนเข้า LINE')
+    line_enabled=st.checkbox('เปิดแจ้งเตือนเมื่อ ENTRY READY',False)
+    line_token=st.text_input('LINE Channel Access Token',type='password',help='จาก LINE Developers Console > แชนแนล Messaging API ของคุณ > Issue token') if line_enabled else ''
+    line_user_id=st.text_input('LINE User ID',help='ถ้าใส่ไว้ จะส่งแบบ push ตรงถึงคุณคนเดียว (แนะนำ) ถ้าเว้นว่างจะ broadcast ถึงทุกคนที่แอด OA นี้') if line_enabled else ''
+    if line_enabled:st.caption('ต้องเปิดแท็บนี้ค้างไว้พร้อม Auto refresh ถึงจะเช็คสัญญาณใหม่ได้ต่อเนื่อง • แผนฟรี LINE OA ส่งได้ราว 200 ข้อความ/เดือน')
 if auto:st.markdown(f'<meta http-equiv="refresh" content="{refresh}">',unsafe_allow_html=True)
 frames,raws,errors,stale={},{},{},{}
 for label in ['1D','4h','1h','15m','5m']:
@@ -345,13 +316,17 @@ short=long=None
 st.markdown('## สถานะการเทรด')
 if have_all:
     short=evaluate(frames,'Short Hold');long=evaluate(frames,'Long Hold');a,b=st.columns(2)
-    with a:render_card(short,'Short Hold')
-    with b:render_card(long,'Long Hold')
-    line_result=maybe_send_line_entry_alert(asset_name,frames,[('Short Hold',short),('Long Hold',long)])
-    if line_result is not None:
-        ok,msg=line_result
-        if ok: st.success('LINE: ส่ง ENTRY READY แล้ว')
-        else: st.error(msg)
+    sizing={'balance':account_balance,'risk_pct':risk_pct,'contract':CONTRACT_SIZE.get(symbol,1.0)} if use_sizing else None
+    with a:render_card(short,'Short Hold',sizing)
+    with b:render_card(long,'Long Hold',sizing)
+    if use_sizing and short['status']=='ENTRY READY' and long['status']=='ENTRY READY' and short['plan'] and long['plan']:
+        st.warning(f"⚠️ ทั้งสองโหมดพร้อมเข้าพร้อมกัน = ทิศทางเดียวกัน ถ้าเปิดทั้งคู่ ความเสี่ยงรวมจะเป็น {2*risk_pct:g}% ของพอร์ต — เลือกโหมดเดียว หรือแบ่งความเสี่ยงคนละครึ่ง")
+    if line_enabled and line_token:
+        for mode_name,res in (('Short Hold',short),('Long Hold',long)):
+            out=maybe_notify_entry(line_token,symbol,mode_name,res,sizing,line_user_id or None)
+            if out is not None:
+                ok,err=out
+                st.toast(f'ส่งแจ้งเตือน LINE ({mode_name}) แล้ว' if ok else f'ส่งแจ้งเตือน LINE ไม่สำเร็จ: {err}', icon='🔔' if ok else '⚠️')
 else:st.info('ข้อมูลบางไทม์เฟรมยังไม่พร้อม — รอแล้วรีเฟรชใหม่')
 st.markdown('## โครงสร้างตลาด'); rows=[]
 for tf in ['1D','4h','1h','15m','5m']:
@@ -365,6 +340,28 @@ if show_signals:
     buys,sells=scan_signals(chart,signal_threshold,signal_gap)
     if buys:fig.add_trace(go.Scatter(x=[x['time'] for x in buys],y=[x['price'] for x in buys],mode='markers',name='BUY',marker=dict(symbol='triangle-up',size=11,color='#22c55e'),text=[f"BUY {x['score']}%" for x in buys],hovertemplate='%{text}<br>%{y}<extra></extra>'))
     if sells:fig.add_trace(go.Scatter(x=[x['time'] for x in sells],y=[x['price'] for x in sells],mode='markers',name='SELL',marker=dict(symbol='triangle-down',size=11,color='#ef4444'),text=[f"SELL {x['score']}%" for x in sells],hovertemplate='%{text}<br>%{y}<extra></extra>'))
+# Trade plan lines: only show Entry/SL/TP when the decision card has an actual ENTRY READY plan.
+# The green/red pullback box remains a zone; it is not itself an order level.
+if short or long:
+    plans=[]
+    if short and short.get('status')=='ENTRY READY' and short.get('plan'):
+        plans.append(('Short Hold', short['direction'], short['plan']))
+    if long and long.get('status')=='ENTRY READY' and long.get('plan'):
+        plans.append(('Long Hold', long['direction'], long['plan']))
+    for label,direction,p in plans:
+        line_color = '#22c55e' if direction=='LONG' else '#ef4444'
+        x_start = chart.index[0]
+        x_end = chart.index[-1] + (chart.index.to_series().diff().dropna().median() if len(chart)>1 else pd.Timedelta(minutes=15))*12
+        levels = [
+            ('ENTRY', float(p['entry']), line_color, 'solid'),
+            ('SL', float(p['sl']), '#ff7f0e', 'dash'),
+            ('TP1', float(p['tp1']), '#3b82f6', 'dash'),
+            ('TP2', float(p['tp2']), '#a855f7', 'dash'),
+        ]
+        for name,level,color,dash in levels:
+            fig.add_shape(type='line',xref='x',yref='y',x0=x_start,x1=x_end,y0=level,y1=level,line=dict(color=color,width=2,dash=dash),layer='above')
+            fig.add_annotation(x=x_end,y=level,text=f'{label} {name} {fmt(level)}',showarrow=False,xanchor='right',yanchor='middle',font=dict(size=10,color=color),bgcolor='rgba(15,15,20,0.75)',borderpad=2)
+
 if show_zone and len(chart)>20 and short and long:
     zones=[]
     for res,label in ((short,'Short Hold'),(long,'Long Hold')):
@@ -378,4 +375,6 @@ if show_zone and len(chart)>20 and short and long:
             x0=chart.index[-1]+step*12*i;x1=chart.index[-1]+step*12*(i+1); lc='#22c55e' if zd=='LONG' else '#ef4444'; fc='rgba(34,197,94,0.16)' if zd=='LONG' else 'rgba(239,68,68,0.16)'; fig.add_shape(type='rect',xref='x',yref='y',x0=x0,x1=x1,y0=e-.75*atr,y1=e+.75*atr,fillcolor=fc,line=dict(width=1,color=lc,dash='dot'),layer='below');fig.add_annotation(x=x1,y=e+.75*atr,text=f'{zl} ({zd})',showarrow=False,xanchor='right',yanchor='bottom',font=dict(size=10,color=lc))
 fig.update_layout(height=520,xaxis_rangeslider_visible=False,margin=dict(l=10,r=10,t=30,b=10));st.plotly_chart(fig,use_container_width=True)
 if show_signals:st.caption('BUY/SELL บนกราฟเป็น raw candle markers เท่านั้น ไม่ได้ผ่าน Macro/Tactical gate และไม่ส่งคำสั่งจริง')
-st.markdown('## หลักการของ V4.7');st.write('Trend-following only: D1/H4/H1/M15 ต้อง align กันก่อน ENTRY READY และ Macro Strength ต้อง ≥60. M15 เป็น setup และ M5 เป็น trigger. M5 trigger ใช้เฉพาะ breakout/reclaim/rejection points; ไม่มีคะแนนฟรีจาก volume หรือ EMA. Short Hold ไม่มี COUNTER-MACRO ENTRY. Long Hold ที่ TF ย่อยยังไม่ align จะแสดง PULLBACK / RESUME และยังไม่เป็น ENTRY READY. ระบบเป็น analyzer ไม่ส่งคำสั่งซื้อขายอัตโนมัติ และ LINE ใช้ Push ไปยัง LINE_USER_ID ที่กำหนดเท่านั้น ไม่ใช้ Broadcast')
+if short or long:
+    st.caption('กรอบเขียว/แดง = Entry Zone สำหรับเฝ้ารอ ไม่ใช่คำสั่งเข้าอัตโนมัติ • เส้น ENTRY/SL/TP1/TP2 จะขึ้นเมื่อระบบได้ ENTRY READY เท่านั้น')
+st.markdown('## หลักการของ V4.7');st.write('Trend-following only: D1/H4/H1/M15 ต้อง align กันก่อน ENTRY READY และ Macro Strength ต้อง ≥60. M15 เป็น setup และ M5 เป็น trigger. M5 trigger ใช้เฉพาะ breakout/reclaim/rejection points; ไม่มีคะแนนฟรีจาก volume หรือ EMA. Short Hold ไม่มี COUNTER-MACRO ENTRY. Long Hold ที่ TF ย่อยยังไม่ align จะแสดง PULLBACK / RESUME และยังไม่เป็น ENTRY READY. ระบบเป็น analyzer ไม่ส่งคำสั่งซื้อขายอัตโนมัติ')
