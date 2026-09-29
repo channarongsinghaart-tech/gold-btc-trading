@@ -18,8 +18,8 @@ LINE_TOKEN_DEFAULT=os.getenv('2eaa3e7096d9f4035d674ee0683f320d','')
 LINE_USER_ID_DEFAULT=os.getenv('U3d78e626c70085bcd9da189d9f77abfc','')
 try:
     if not API_KEY and 'TWELVEDATA_API_KEY' in st.secrets: API_KEY=str(st.secrets['TWELVEDATA_API_KEY'])
-    if not LINE_TOKEN_DEFAULT and 'LINE_CHANNEL_ACCESS_TOKEN' in st.secrets: LINE_TOKEN_DEFAULT=str(st.secrets['LINE_CHANNEL_ACCESS_TOKEN'])
-    if not LINE_USER_ID_DEFAULT and 'LINE_USER_ID' in st.secrets: LINE_USER_ID_DEFAULT=str(st.secrets['LINE_USER_ID'])
+    if not LINE_TOKEN_DEFAULT and '2eaa3e7096d9f4035d674ee0683f320d' in st.secrets: LINE_TOKEN_DEFAULT=str(st.secrets['LINE_CHANNEL_ACCESS_TOKEN'])
+    if not LINE_USER_ID_DEFAULT and 'U3d78e626c70085bcd9da189d9f77abfc' in st.secrets: LINE_USER_ID_DEFAULT=str(st.secrets['LINE_USER_ID'])
 except Exception: pass
 
 def _pace_requests():
