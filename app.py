@@ -14,8 +14,8 @@ CACHE_TTL=60
 _last_call_ts=0.0
 _LAST_GOOD={}
 API_KEY=os.getenv('TWELVEDATA_API_KEY','')
-LINE_TOKEN_DEFAULT=os.getenv('LINE_CHANNEL_ACCESS_TOKEN','')
-LINE_USER_ID_DEFAULT=os.getenv('LINE_USER_ID','')
+LINE_TOKEN_DEFAULT=os.getenv('2eaa3e7096d9f4035d674ee0683f320d','')
+LINE_USER_ID_DEFAULT=os.getenv('U3d78e626c70085bcd9da189d9f77abfc','')
 try:
     if not API_KEY and 'TWELVEDATA_API_KEY' in st.secrets: API_KEY=str(st.secrets['TWELVEDATA_API_KEY'])
     if not LINE_TOKEN_DEFAULT and 'LINE_CHANNEL_ACCESS_TOKEN' in st.secrets: LINE_TOKEN_DEFAULT=str(st.secrets['LINE_CHANNEL_ACCESS_TOKEN'])
