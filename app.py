@@ -19,8 +19,8 @@ try:
 except Exception: pass
 
 # LINE Messaging API (push to ONE exact user only; never broadcast)
-LINE_TOKEN=2eaa3e7096d9f4035d674ee0683f320d
-LINE_USER_ID=U3d78e626c70085bcd9da189d9f77abfc
+LINE_TOKEN='2eaa3e7096d9f4035d674ee0683f320d'
+LINE_USER_ID='U3d78e626c70085bcd9da189d9f77abfc'
 try:
     if 'LINE_CHANNEL_ACCESS_TOKEN' in st.secrets:
         LINE_TOKEN=str(st.secrets['LINE_CHANNEL_ACCESS_TOKEN'])
