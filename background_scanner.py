@@ -88,20 +88,50 @@ def push(text):
     r=requests.post('https://api.line.me/v2/bot/message/push',headers={'Authorization':f'Bearer {TOKEN}','Content-Type':'application/json'},json={'to':USER_ID,'messages':[{'type':'text','text':text}]},timeout=15); r.raise_for_status()
 
 def scan_asset(name,symbol):
+    print(f"[SCAN] {name} ({symbol})")
     fr={}
     for label in TF:
         fr[label]=ind(fetch(symbol,TF[label])); time.sleep(2)
     d1,h4,h1,m15,m5=[state(fr[x]) for x in ('1D','4h','1h','15m','5m')]
+    print(f"[STATE] {name}: D1={d1} H4={h4} H1={h1} M15={m15} M5={m5}")
     if d1[0] not in ('LONG','SHORT') or not (h4[0]==h1[0]==m15[0]==d1[0]) or d1[1]<60: return []
-    direction=d1[0]; ok_setup,s_score,s_name=setup(fr['15m'],direction); ok_trig,t_score=trigger(fr['5m'],direction)
+    direction=d1[0]
+    ok_setup,s_score,s_name=setup(fr['15m'],direction)
+    ok_trig,t_score=trigger(fr['5m'],direction)
+
+    print(f"[CHECK] {name}: setup={ok_setup} score={s_score} name={s_name} trigger={ok_trig} score={t_score}")
+
     alerts=[]
+
     for mode in ('Short Hold','Long Hold'):
         ready=ok_setup and ok_trig
+
         p=plan(fr,direction,mode) if ready else None
+
         if p:
+            entry,sl,tp1,tp2=p
             candle=str(fr['5m'].index[-1])
-            sig=f'{symbol}|{mode}|{direction}|{candle}|{round(p[0],4)}|{round(p[1],4)}'
-            alerts.append((sig,f'🚨 {name} | {mode}\n{direction} — ENTRY READY\nEntry: {p[0]:,.2f}\nSL: {p[1]:,.2f}\nTP1: {p[2]:,.2f}\nTP2: {p[3]:,.2f}\nMacro: {d1[0]} {d1[1]}/100\nTactical: {m15[0]} {m15[1]}/100\nM15: {s_name}\nM5 trigger: {t_score}/100'))
+
+            sig=f'{symbol}|{mode}|{direction}|{candle}|{round(entry,4)}|{round(sl,4)}'
+
+            msg=(
+                f'🚨 {name} | {mode}\n'
+                f'{direction} — ENTRY READY\n'
+                f'Entry: {entry:.4f}\n'
+                f'SL: {sl:.4f}\n'
+                f'TP1: {tp1:.4f}\n'
+                f'TP2: {tp2:.4f}\n'
+                f'Setup: {s_name} ({s_score})\n'
+                f'Trigger: {t_score}'
+            )
+
+            alerts.append((sig,msg))
+
+    if alerts:
+        print(f"[RESULT] {name}: {len(alerts)} ENTRY READY")
+    else:
+        print(f"[RESULT] {name}: NO ENTRY")
+
     return alerts
 
 def main():
