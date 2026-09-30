@@ -130,7 +130,6 @@ def range_info(d, n=48):
 
 def macro_context(d1, h4, h1, m15):
     s1, s4, sH, s15 = [tf_state(x) for x in [d1, h4, h1, m15]]
-    # Macro uses D1/H4. Tactical uses H1/M15. They are intentionally separate.
     if s1['bias'] == s4['bias'] and s1['bias'] in ('LONG', 'SHORT'):
         macro = s1['bias']
         macro_strength = int(round((s1['score'] + s4['score']) / 2))
@@ -196,8 +195,6 @@ def m15_setup(d, tactical):
     if d is None or len(d) < 80 or tactical == 'NEUTRAL':
         return {'ok': False, 'near': False, 'score': 0, 'name': 'รอ M15 setup', 'type': 'NONE', 'age': None}
 
-    # Setup may persist for up to 2 closed M15 candles. This is setup context,
-    # not permission to enter by itself.
     candidates=[]
     for off in (0,1,2):
         sub=d if off==0 else d.iloc[:-off]
@@ -219,6 +216,7 @@ def m15_setup(d, tactical):
     return {'ok': False, 'near': near, 'score': 52 if near else 35,
             'name': 'M15 ใกล้ setup zone' if near else 'รอ M15 pullback / breakout / sweep / continuation',
             'type':'NEAR' if near else 'NONE', 'age': None}
+
 
 def m5_trigger(d, direction):
     """Fresh M5 trigger for execution.
@@ -258,7 +256,6 @@ def m5_trigger(d, direction):
                     25*components['reject'] + 10*components['volume'] + 20*components['side'])
         name = 'M5 bearish trigger'
 
-    # Require a real trigger event, not just price being on one side of EMA20.
     event = components['break'] or components['reclaim'] or components['reject']
     ok = bool(event and score >= 55)
     if not ok:
@@ -268,6 +265,7 @@ def m5_trigger(d, direction):
             'type': 'NONE', 'age': 0, 'fresh': False
         }
     return {'ok': True, 'score': int(score), 'name': name, 'type': direction, 'age': 0, 'fresh': True}
+
 
 def range_location(h4,h1,direction):
     if direction not in ('LONG','SHORT'):
@@ -284,6 +282,7 @@ def range_location(h4,h1,direction):
         if 'UPPER RANGE' in zones: return {'score':75,'zone':'UPPER/MID','reason':'มีอย่างน้อยหนึ่ง TF อยู่โซนบน'}
         if zones.count('LOWER RANGE')==2: return {'score':30,'zone':'LOWER RANGE','reason':'ราคาอยู่โซนล่าง ไม่เหมาะกับการไล่ Short'}
         return {'score':55,'zone':'MID RANGE','reason':'H4/H1 อยู่กลาง range'}
+
 
 def make_plan(frames, direction, mode):
     m5, m15, h1, h4 = frames['5m'], frames['15m'], frames['1h'], frames['4h']
@@ -384,6 +383,7 @@ def evaluate(frames, mode):
         'readiness': readiness, 'plan': plan, 'reason': reason, 'states': ctx,
     }
 
+
 # LINE Messaging API — Push to the configured User ID only (no Broadcast).
 LINE_TOKEN = ''
 LINE_USER_ID = ''
@@ -394,6 +394,7 @@ except Exception:
     pass
 
 _LAST_NOTIFIED = set()
+
 
 def notify_line(symbol, mode, result):
     if not LINE_TOKEN or not LINE_USER_ID or result.get('status') != 'ENTRY READY' or not result.get('plan'):
@@ -420,60 +421,122 @@ def notify_line(symbol, mode, result):
     except Exception as exc:
         return False, f'LINE Push error: {exc}'
 
+
 def fmt(v):
     return '—' if v is None or not np.isfinite(v) else f'{v:,.2f}'
 
 
 def render_card(result, title):
-    ready = result['status'] == 'ENTRY READY'
-    pre = result['status'] == 'PRE-ENTRY'
-    counter = result['entry_class'] == 'COUNTER-MACRO ENTRY'
-    if counter and ready:
-        headline = '⚠️ COUNTER-MACRO ENTRY'
-    elif ready and result['direction'] == 'LONG':
-        headline = '🟢 ENTRY READY — LONG'
-    elif ready and result['direction'] == 'SHORT':
-        headline = '🔴 ENTRY READY — SHORT'
-    elif result['entry_class'] == 'PULLBACK / RESUME':
-        headline = f'🟡 PULLBACK / RESUME — {result["direction"]}'
-    elif pre:
-        headline = f'🟡 PRE-ENTRY — {result["direction"]}'
+    status = result['status']
+    direction = result['direction']
+
+    if status == 'ENTRY READY':
+        headline = f'🚨 ENTRY READY — {direction}'
+        box_type = 'success'
+    elif status == 'PRE-ENTRY':
+        headline = f'🟡 PRE-ENTRY — {direction}'
+        box_type = 'warning'
     else:
-        headline = f'⚪ WAIT — {result["direction"]}'
+        headline = f'⏳ WAIT FOR ENTRY — {direction}'
+        box_type = 'info'
 
     st.markdown(f'### {title}')
-    st.markdown(f'**{headline}**')
-    if counter:
-        st.warning('COUNTER-MACRO — Short Hold เท่านั้น; Macro D1/H4 สวนกับ Tactical H1/M15. ต้องผ่าน M15 setup + M5 trigger สดที่เข้มงวดกว่า Trend Entry')
-    elif result['entry_class'] == 'PULLBACK / RESUME':
-        st.info('PULLBACK / RESUME — Macro กับ Tactical ยังสวนกัน จึงยังไม่ถือเป็น Long Hold entry')
-    elif result['entry_class'] == 'TREND ENTRY':
-        st.caption('TREND ENTRY — Macro และ Tactical ไปทางเดียวกัน')
-    a,b,c = st.columns(3)
-    a.metric('Macro D1/H4', f"{result['macro']} {result['macro_strength']}/100")
-    b.metric('Tactical H1/M15', f"{result['tactical']} {result['tactical_strength']}/100")
-    c.metric('Setup Readiness', f"{result['readiness']}/100")
-    age = result['setup'].get('age')
-    trig_age = result['trigger'].get('age')
-    setup_age = 'latest' if age == 0 else f'{age} M15 bar ago' if age is not None else '—'
-    trigger_fresh = 'สด' if result['trigger'].get('fresh') else 'ยังไม่สด'
-    st.caption(f"Signal Class: {result['entry_class']} • Macro {result['macro']} • Tactical {result['tactical']} • {result['relation']} • H4/H1 {result['location']['zone']} • M15 {result['setup']['name']} [{setup_age}] • M5 {result['trigger']['name']} [{trigger_fresh}]")
-    if pre:
-        st.info(f"PRE-ENTRY: {result['reason']}")
-    elif ready:
-        st.success(f"ENTRY READY: {result['reason']}")
-    else:
-        st.info(f"WAIT: {result['reason']}")
-    if ready and result['plan']:
-        p = result['plan']
-        a,b,c,d = st.columns(4)
-        a.metric('Entry', fmt(p['entry'])); b.metric('SL', fmt(p['sl'])); c.metric('TP1', fmt(p['tp1'])); d.metric('TP2', fmt(p['tp2']))
-        st.caption(f"R:R to TP2 ≈ {p['rr']:.2f}R")
-    else:
-        st.caption('ยังไม่แสดง Entry / SL / TP จนกว่าจะเกิด ENTRY READY')
 
-st.title('Gold & Bitcoin Trading Analyzer — V4.7 Trend Following')
-st.caption('V4.7 Trend Following: D1/H4 → H1/M15 → M15 setup → M5 fresh trigger. Counter-Macro Entry ถูกตัดออก')
+    with st.container(border=True):
+        if box_type == 'success':
+            st.success(headline)
+        elif box_type == 'warning':
+            st.warning(headline)
+        else:
+            st.info(headline)
+
+        a, b, c = st.columns(3)
+
+        a.metric(
+            'Macro D1/H4',
+            f"{result['macro']} {result['macro_strength']}/100"
+        )
+
+        b.metric(
+            'Tactical H1/M15',
+            f"{result['tactical']} {result['tactical_strength']}/100"
+        )
+
+        c.metric(
+            'Readiness',
+            f"{result['readiness']}/100"
+        )
+
+        st.divider()
+
+        setup = result['setup']
+        trigger = result['trigger']
+
+        setup_status = 'พร้อม' if setup.get('ok') else 'รอ'
+        trigger_status = 'สด' if trigger.get('fresh') else 'รอ'
+
+        st.write(
+            f"**M15 Setup:** {setup_status} — {setup['name']}"
+        )
+
+        st.write(
+            f"**M5 Trigger:** {trigger_status} — {trigger['name']}"
+        )
+
+        st.write(
+            f"**H4/H1 Location:** {result['location']['zone']}"
+        )
+
+        st.write(
+            f"**Macro / Tactical:** "
+            f"{result['macro']} / {result['tactical']} "
+            f"— {result['relation']}"
+        )
+
+        st.divider()
+
+        if status == 'ENTRY READY':
+            st.success(
+                f"ENTRY READY: {result['reason']}"
+            )
+
+            if result['plan']:
+                p = result['plan']
+
+                a, b, c, d = st.columns(4)
+
+                a.metric('Entry', fmt(p['entry']))
+                b.metric('SL', fmt(p['sl']))
+                c.metric('TP1', fmt(p['tp1']))
+                d.metric('TP2', fmt(p['tp2']))
+
+                st.caption(
+                    f"R:R to TP2 ≈ {p['rr']:.2f}R"
+                )
+
+        elif status == 'PRE-ENTRY':
+            st.warning(
+                f"🟡 กรอบเตรียมเข้า: {result['reason']}"
+            )
+
+            st.caption(
+                'ยังไม่แสดง Entry / SL / TP '
+                'จนกว่าจะเกิด ENTRY READY'
+            )
+
+        else:
+            st.info(
+                f"⏳ กำลังรอเข้า: {result['reason']}"
+            )
+
+            st.caption(
+                'ระบบยังไม่อนุญาตให้เข้า '
+                'รอ Setup + M5 Trigger ตามเงื่อนไข'
+            )
+
+
+st.title('Gold & Bitcoin Trading Analyzer — V4.8 Trend Following')
+st.caption('V4.8 Trend Following: D1/H4 → H1/M15 → M15 setup → M5 fresh trigger. Counter-Macro Entry ถูกตัดออก')
 
 with st.sidebar:
     st.header('ตั้งค่าการวิเคราะห์')
@@ -484,16 +547,26 @@ with st.sidebar:
     auto = st.checkbox('Auto refresh', False)
     refresh = st.slider('รอบรีเฟรช (วินาที)', 30, 300, 60, 10)
     if st.button('รีเฟรชข้อมูลตอนนี้'):
-        st.cache_data.clear(); st.rerun()
+        st.cache_data.clear()
+        st.rerun()
     st.divider()
     if LINE_TOKEN and LINE_USER_ID:
         st.success('LINE Push: พร้อม — ส่งหา User ID นี้เท่านั้น')
     else:
         st.warning('LINE Push: ยังไม่ได้ตั้ง Secrets')
     if st.button('ทดสอบ LINE Push'):
-        ok, msg = notify_line(symbol, 'TEST', {'status':'ENTRY READY','direction':'LONG','plan':{'entry':0,'sl':0,'tp1':0,'tp2':0},'macro':'TEST','macro_strength':100,'tactical':'TEST','tactical_strength':100})
+        ok, msg = notify_line(symbol, 'TEST', {
+            'status':'ENTRY READY',
+            'direction':'LONG',
+            'plan':{'entry':0,'sl':0,'tp1':0,'tp2':0},
+            'macro':'TEST',
+            'macro_strength':100,
+            'tactical':'TEST',
+            'tactical_strength':100
+        })
         st.success(msg) if ok else st.error(msg)
-    st.divider(); st.caption('API: Twelve Data')
+    st.divider()
+    st.caption('API: Twelve Data')
 
 if auto:
     st.markdown(f'<meta http-equiv="refresh" content="{refresh}">', unsafe_allow_html=True)
@@ -502,42 +575,81 @@ frames, errors = {}, {}
 for label in ['1D','4h','1h','15m','5m']:
     raw, err = get_ohlcv(symbol, TF[label], outputsize)
     if err:
-        errors[label] = err; frames[label] = pd.DataFrame()
+        errors[label] = err
+        frames[label] = pd.DataFrame()
     else:
         frames[label] = indicators(closed_only(raw))
 
 chart_raw, chart_err = get_ohlcv(symbol, TF[chart_tf], outputsize)
 chart = indicators(chart_raw) if not chart_raw.empty else pd.DataFrame()
-if chart_err: errors[chart_tf] = chart_err
+if chart_err:
+    errors[chart_tf] = chart_err
 if errors:
-    st.error(' | '.join(f'{k}: {v}' for k,v in errors.items())); st.stop()
+    st.error(' | '.join(f'{k}: {v}' for k,v in errors.items()))
+    st.stop()
 
-price = float(chart.close.iloc[-1]); prev = float(chart.close.iloc[-2]) if len(chart)>1 else price
+price = float(chart.close.iloc[-1])
+prev = float(chart.close.iloc[-2]) if len(chart)>1 else price
 pct = (price/prev-1)*100 if prev else 0
-st.subheader(asset_name); st.metric('Price', fmt(price), f'{pct:+.2f}%')
+st.subheader(asset_name)
+st.metric('Price', fmt(price), f'{pct:+.2f}%')
 
-short = evaluate(frames, 'Short Hold'); long = evaluate(frames, 'Long Hold')
+short = evaluate(frames, 'Short Hold')
+long = evaluate(frames, 'Long Hold')
+
 for _mode, _result in [('Short Hold', short), ('Long Hold', long)]:
     if _result.get('status') == 'ENTRY READY':
         _ok, _msg = notify_line(symbol, _mode, _result)
         if not _ok and LINE_TOKEN and LINE_USER_ID:
             st.warning(_msg)
+
 st.markdown('## สถานะการเทรด')
 a,b = st.columns(2)
-with a: render_card(short, 'Short Hold')
-with b: render_card(long, 'Long Hold')
+with a:
+    render_card(short, 'Short Hold')
+with b:
+    render_card(long, 'Long Hold')
 
 st.markdown('## โครงสร้างตลาด')
 rows=[]
 for tf in ['1D','4h','1h','15m','5m']:
-    d=frames[tf]; s=tf_state(d); rg=range_info(d,48)
-    rows.append({'TF':tf,'Bias':s['bias'],'Trend':s['score'],'Structure':s['structure'],'Range':rg['zone'],'Range High':rg['high'],'Range Low':rg['low']})
+    d=frames[tf]
+    s=tf_state(d)
+    rg=range_info(d,48)
+    rows.append({
+        'TF':tf,
+        'Bias':s['bias'],
+        'Trend':s['score'],
+        'Structure':s['structure'],
+        'Range':rg['zone'],
+        'Range High':rg['high'],
+        'Range Low':rg['low']
+    })
 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 st.markdown(f'## กราฟ {chart_tf}')
-fig=go.Figure(); fig.add_trace(go.Candlestick(x=chart.index,open=chart.open,high=chart.high,low=chart.low,close=chart.close,name='Price'))
-for n in (20,50,200): fig.add_trace(go.Scatter(x=chart.index,y=chart[f'EMA{n}'],name=f'EMA{n}',mode='lines'))
-fig.update_layout(height=520,xaxis_rangeslider_visible=False,margin=dict(l=10,r=10,t=30,b=10)); st.plotly_chart(fig,use_container_width=True)
+fig=go.Figure()
+fig.add_trace(go.Candlestick(
+    x=chart.index,
+    open=chart.open,
+    high=chart.high,
+    low=chart.low,
+    close=chart.close,
+    name='Price'
+))
+for n in (20,50,200):
+    fig.add_trace(go.Scatter(
+        x=chart.index,
+        y=chart[f'EMA{n}'],
+        name=f'EMA{n}',
+        mode='lines'
+    ))
+fig.update_layout(
+    height=520,
+    xaxis_rangeslider_visible=False,
+    margin=dict(l=10,r=10,t=30,b=10)
+)
+st.plotly_chart(fig,use_container_width=True)
 
 st.markdown('## หลักการของ V4.8')
 st.write('D1/H4 = Macro. H1/M15 = Tactical. M15 = setup context. M5 = execution trigger. Short Hold ตาม Tactical และสามารถสวน Macro ได้ แต่ Counter-Macro ต้องมี M15 setup ≥70, M5 trigger ≥70 แบบสด, Tactical ≥70 และ location ได้เปรียบ. Long Hold ตาม Macro และห้าม ENTRY READY ขณะ Tactical ยังสวน Macro. Readiness ของ Counter-Macro จะไม่เอา Macro strength มาช่วยดันคะแนน. M5 trigger ต้องเกิดจาก break/reclaim/reject จริง ไม่ใช่แค่ราคาอยู่เหนือ/ต่ำกว่า EMA20. Entry/SL/TP แสดงเฉพาะ ENTRY READY.')
