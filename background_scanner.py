@@ -1,5 +1,7 @@
 import os, time, json
 from pathlib import Path
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import requests
@@ -11,6 +13,17 @@ TOKEN=os.getenv('LINE_CHANNEL_ACCESS_TOKEN','').strip()
 USER_ID=os.getenv('LINE_USER_ID','').strip()
 API_KEY=os.getenv('TWELVEDATA_API_KEY','').strip()
 STATE=Path('alert_state.json')
+
+# Scan only during Alberta (Mountain Time) daytime hours. zoneinfo tracks
+# MST/MDT switchovers automatically, so this stays correct at 3AM/10PM local
+# time year-round without any manual UTC math.
+ACTIVE_TZ=ZoneInfo('America/Edmonton')
+ACTIVE_START_HOUR=4    # 3:00 AM
+ACTIVE_END_HOUR=22     # 10:00 PM (window is [3:00, 22:00) local time)
+
+def within_active_window():
+    now=datetime.now(ACTIVE_TZ)
+    return ACTIVE_START_HOUR<=now.hour<ACTIVE_END_HOUR
 
 # Free-plan Twelve Data key: 8 credits/minute, shared across BOTH assets in
 # this run AND anything else using the same key (e.g. the Streamlit app, if
@@ -164,6 +177,10 @@ def scan_asset(name,symbol):
     return alerts
 
 def main():
+    if not within_active_window():
+        now=datetime.now(ACTIVE_TZ)
+        print(f'[SKIP] Outside active window: {now:%Y-%m-%d %H:%M %Z} (Alberta) — active {ACTIVE_START_HOUR:02d}:00-{ACTIVE_END_HOUR:02d}:00')
+        return
     if not all([API_KEY,TOKEN,USER_ID]): raise SystemExit('Missing TWELVEDATA_API_KEY / LINE_CHANNEL_ACCESS_TOKEN / LINE_USER_ID')
     state=load_state(); changed=False
     for name,symbol in ASSETS.items():
