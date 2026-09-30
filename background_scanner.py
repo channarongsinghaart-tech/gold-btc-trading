@@ -18,12 +18,13 @@ STATE=Path('alert_state.json')
 # MST/MDT switchovers automatically, so this stays correct at 3AM/10PM local
 # time year-round without any manual UTC math.
 ACTIVE_TZ=ZoneInfo('America/Edmonton')
-ACTIVE_START_HOUR=4    # 4:00 AM
-ACTIVE_END_HOUR=22     # 10:00 PM (window is [3:00, 22:00) local time)
+ACTIVE_START=(4,0)     # 4:00 AM
+ACTIVE_END=(21,30)     # 9:30 PM (window is [4:00, 21:30) local time)
 
 def within_active_window():
     now=datetime.now(ACTIVE_TZ)
-    return ACTIVE_START_HOUR<=now.hour<ACTIVE_END_HOUR
+    mins=now.hour*60+now.minute
+    return ACTIVE_START[0]*60+ACTIVE_START[1] <= mins < ACTIVE_END[0]*60+ACTIVE_END[1]
 
 # Free-plan Twelve Data key: 8 credits/minute, shared across BOTH assets in
 # this run AND anything else using the same key (e.g. the Streamlit app, if
@@ -102,21 +103,26 @@ def trigger(d,direction):
         br=x.close>p.high and x.close>x.open and x.body_ratio>=0.20; rec=x.close>x.EMA20 and p.close<=p.EMA20 and x.close>x.open; rej=x.lower_wick>=0.20*rg and x.close>x.open and x.close>=x.low+0.55*rg
     else:
         br=x.close<p.low and x.close<x.open and x.body_ratio>=0.20; rec=x.close<x.EMA20 and p.close>=p.EMA20 and x.close<x.open; rej=x.upper_wick>=0.20*rg and x.close<x.open and x.close<=x.high-0.55*rg
-    vol=float(x.VolRatio) if np.isfinite(x.VolRatio) else 1.0; side=(x.close>x.EMA20) if direction=='LONG' else (x.close<x.EMA20)
-    score=min(100,40*int(br)+35*int(rec)+25*int(rej)+10*int(vol>=1.0)+20*int(side)); ok=(br or rec or rej) and score>=55
+    score=min(100,40*int(br)+35*int(rec)+25*int(rej)); ok=(br or rec or rej) and score>=55
     return bool(ok),int(score)
 
 def plan(fr,direction,mode):
     m5,m15,h1=fr['5m'],fr['15m'],fr['1h']; entry=float(m5.close.iloc[-1] if mode=='Short Hold' else m15.close.iloc[-1]); atr=float(m5.ATR.iloc[-1] if mode=='Short Hold' else m15.ATR.iloc[-1])
     if mode=='Short Hold':
-        sl=(float(m5.tail(12).low.min())-0.25*atr) if direction=='LONG' else (float(m5.tail(12).high.max())+0.25*atr); maxr=2.8
+        min_r,maxr=1.0*atr,2.8*atr
+        sl=(float(m5.tail(12).low.min())-0.25*atr) if direction=='LONG' else (float(m5.tail(12).high.max())+0.25*atr)
         r=entry-sl if direction=='LONG' else sl-entry
-        if r<=0 or r>maxr*atr:return None
+        if 0<r<min_r:
+            r=min_r; sl=entry-r if direction=='LONG' else entry+r
+        if r<=0 or r>maxr:return None
         tp1,tp2=(entry+1.2*r,entry+1.8*r) if direction=='LONG' else (entry-1.2*r,entry-1.8*r)
     else:
-        sl=(min(float(m15.tail(14).low.min()),float(h1.tail(10).low.min()))-0.30*atr) if direction=='LONG' else (max(float(m15.tail(14).high.max()),float(h1.tail(10).high.max()))+0.30*atr); maxr=5.0
+        min_r,maxr=1.2*atr,5.0*atr
+        sl=(min(float(m15.tail(14).low.min()),float(h1.tail(10).low.min()))-0.30*atr) if direction=='LONG' else (max(float(m15.tail(14).high.max()),float(h1.tail(10).high.max()))+0.30*atr)
         r=entry-sl if direction=='LONG' else sl-entry
-        if r<=0 or r>maxr*atr:return None
+        if 0<r<min_r:
+            r=min_r; sl=entry-r if direction=='LONG' else entry+r
+        if r<=0 or r>maxr:return None
         tp1,tp2=(entry+1.5*r,entry+3*r) if direction=='LONG' else (entry-1.5*r,entry-3*r)
     return entry,sl,tp1,tp2
 
@@ -179,7 +185,7 @@ def scan_asset(name,symbol):
 def main():
     if not within_active_window():
         now=datetime.now(ACTIVE_TZ)
-        print(f'[SKIP] Outside active window: {now:%Y-%m-%d %H:%M %Z} (Alberta) — active {ACTIVE_START_HOUR:02d}:00-{ACTIVE_END_HOUR:02d}:00')
+        print(f'[SKIP] Outside active window: {now:%Y-%m-%d %H:%M %Z} (Alberta) — active {ACTIVE_START[0]:02d}:{ACTIVE_START[1]:02d}-{ACTIVE_END[0]:02d}:{ACTIVE_END[1]:02d}')
         return
     if not all([API_KEY,TOKEN,USER_ID]): raise SystemExit('Missing TWELVEDATA_API_KEY / LINE_CHANNEL_ACCESS_TOKEN / LINE_USER_ID')
     state=load_state(); changed=False
