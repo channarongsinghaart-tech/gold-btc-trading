@@ -18,7 +18,7 @@ STATE=Path('alert_state.json')
 # MST/MDT switchovers automatically, so this stays correct at 3AM/10PM local
 # time year-round without any manual UTC math.
 ACTIVE_TZ=ZoneInfo('America/Edmonton')
-ACTIVE_START_HOUR=4    # 3:00 AM
+ACTIVE_START_HOUR=4    # 4:00 AM
 ACTIVE_END_HOUR=22     # 10:00 PM (window is [3:00, 22:00) local time)
 
 def within_active_window():
