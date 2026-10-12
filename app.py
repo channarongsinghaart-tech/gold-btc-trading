@@ -9,10 +9,10 @@ st.set_page_config(page_title='Gold & Bitcoin Trading Analyzer V4.7', page_icon=
 BASE='https://api.twelvedata.com'
 ASSETS={'Bitcoin BTC/USD':'BTC/USD','Gold XAU/USD':'XAU/USD'}
 TF={'5m':'5min','15m':'15min','1h':'1h','4h':'4h','1D':'1day'}
-MIN_CALL_INTERVAL=1.1
-CACHE_TTL=60
-_last_call_ts=0.0
-_LAST_GOOD={}
+# อายุ cache ตาม timeframe (วินาที) — TF ใหญ่แท่งเปลี่ยนช้า ไม่ต้องดึงใหม่บ่อย
+TTL_BY_TF={'5min':60,'15min':180,'1h':900,'4h':1800,'1day':3600}
+FETCH_SIZE=500          # ดึงขนาดเดียวเสมอ แล้วค่อยตัดแท่งตามสไลเดอร์ตอนแสดงกราฟ
+MAX_CALLS_PER_MIN=7     # Twelve Data แผนฟรี ~8/นาที เหลือ buffer 1
 API_KEY=os.getenv('TWELVEDATA_API_KEY','')
 LINE_TOKEN_DEFAULT=os.getenv('LINE_CHANNEL_ACCESS_TOKEN','')
 LINE_USER_ID_DEFAULT=os.getenv('LINE_USER_ID','')
@@ -22,11 +22,24 @@ try:
     if not LINE_USER_ID_DEFAULT and 'LINE_USER_ID' in st.secrets: LINE_USER_ID_DEFAULT=str(st.secrets['LINE_USER_ID'])
 except Exception: pass
 
+# Streamlit รันสคริปต์ใหม่ทุก rerun ตัวแปร global ธรรมดาจึงถูกรีเซ็ตทุกครั้ง
+# ใช้ cache_resource เก็บสถานะที่ต้องอยู่ข้าม rerun / ข้ามการสลับสินทรัพย์
+@st.cache_resource
+def _shared_state():
+    return {'last_good':{},'notified':{},'calls':[]}
+_S=_shared_state()
+_LAST_GOOD=_S['last_good']       # {(symbol,interval): DataFrame ล่าสุดที่โหลดสำเร็จ}
+_LAST_NOTIFIED=_S['notified']    # {(symbol,mode): signature} กันส่ง LINE ซ้ำ
+_CALL_TIMES=_S['calls']          # เวลาที่ยิง API ล่าสุด (กันเกินลิมิตต่อนาที)
+
 def _pace_requests():
-    global _last_call_ts
-    wait=MIN_CALL_INTERVAL-(time.monotonic()-_last_call_ts)
-    if wait>0: time.sleep(wait)
-    _last_call_ts=time.monotonic()
+    now=time.monotonic()
+    _CALL_TIMES[:]=[t for t in _CALL_TIMES if now-t<60]
+    if len(_CALL_TIMES)>=MAX_CALLS_PER_MIN:
+        time.sleep(max(0.0,60-(now-_CALL_TIMES[0])+0.5))
+        now=time.monotonic()
+        _CALL_TIMES[:]=[t for t in _CALL_TIMES if now-t<60]
+    _CALL_TIMES.append(time.monotonic())
 
 def api_get(endpoint,params):
     if not API_KEY: return None,'ยังไม่ได้ตั้ง TWELVEDATA_API_KEY'
@@ -43,25 +56,34 @@ def api_get(endpoint,params):
         return data,None
     return None,last
 
-@st.cache_data(ttl=CACHE_TTL,show_spinner=False)
-def _fetch_ohlcv(symbol,interval,outputsize):
+@st.cache_data(ttl=7200,max_entries=40,show_spinner=False)
+def _fetch_ohlcv(symbol,interval,outputsize,bucket):
+    # bucket ทำให้ cache หมดอายุตาม TTL ของแต่ละ TF
+    # ถ้า error จะ raise ซึ่ง st.cache_data ไม่เก็บผลที่ error ไว้
     data,err=api_get('time_series',{'symbol':symbol,'interval':interval,'outputsize':outputsize,'apikey':API_KEY,'timezone':'UTC'})
-    if err:return pd.DataFrame(),err
-    if not data or 'values' not in data:return pd.DataFrame(),(data or {}).get('message','ไม่มีข้อมูล')
+    if err: raise RuntimeError(err)
+    if not data or 'values' not in data: raise RuntimeError((data or {}).get('message','ไม่มีข้อมูล'))
     df=pd.DataFrame(data['values'])
     for c in ['open','high','low','close','volume']:
         if c in df: df[c]=pd.to_numeric(df[c],errors='coerce')
     df['datetime']=pd.to_datetime(df['datetime'],utc=True)
     df=df.sort_values('datetime').set_index('datetime')
-    return df.dropna(subset=['open','high','low','close']),None
+    df=df.dropna(subset=['open','high','low','close'])
+    if df.empty: raise RuntimeError('ไม่มีข้อมูล')
+    return df
 
-def get_ohlcv(symbol,interval,outputsize=500):
-    key=(symbol,interval); df,err=_fetch_ohlcv(symbol,interval,outputsize)
-    if err or df.empty:
+def get_ohlcv(symbol,interval,outputsize=FETCH_SIZE):
+    key=(symbol,interval)
+    bucket=int(time.time()//TTL_BY_TF[interval])
+    try:
+        df=_fetch_ohlcv(symbol,interval,outputsize,bucket)
+        _LAST_GOOD[key]=df
+        return df,None
+    except Exception as e:
         cached=_LAST_GOOD.get(key)
-        if cached is not None and not cached.empty:return cached,f'{err or "ไม่มีข้อมูลใหม่"} (ใช้ข้อมูลล่าสุดที่แคชไว้)'
-        return df,err
-    _LAST_GOOD[key]=df; return df,None
+        if cached is not None and not cached.empty:
+            return cached,f'{e} (ใช้ข้อมูลล่าสุดที่แคชไว้)'
+        return pd.DataFrame(),str(e)
 
 def indicators(df):
     d=df.copy()
@@ -230,7 +252,6 @@ def fmt(v):return '—' if v is None or not np.isfinite(v) else f'{v:,.2f}'
 
 CONTRACT_SIZE={'BTC/USD':1.0,'XAU/USD':100.0}  # units per 1.00 lot (checked against broker history: XAU 100 oz, BTC 1 BTC)
 
-_LAST_NOTIFIED={}  # process-level: {(symbol,mode): signature} so the same ENTRY READY isn't broadcast every rerun
 def notify_line(token,message,user_id=None):
     url='https://api.line.me/v2/bot/message/push' if user_id else 'https://api.line.me/v2/bot/message/broadcast'
     body={'messages':[{'type':'text','text':message[:4900]}]}
@@ -260,6 +281,7 @@ def maybe_notify_entry(token,symbol,mode,r,sizing,user_id=None):
     ok,err=notify_line(token,'\n'.join(lines),user_id)
     if ok:_LAST_NOTIFIED[key]=sig
     return ok,err
+
 def position_size(balance,risk_pct,entry,sl,contract,step=0.01):
     """Lot size so that hitting SL loses ~risk_pct of balance. Rounds DOWN to the lot step, never up."""
     dist=abs(entry-sl)
@@ -293,9 +315,9 @@ def render_card(r,title,sizing=None):
 st.title('Gold & Bitcoin Trading Analyzer — V4.7')
 st.caption('D1 trend → H4 → H1 → M15 setup → M5 trigger. Short Hold และ Long Hold แสดงพร้อมกัน • Trend-following only')
 with st.sidebar:
-    st.header('ตั้งค่าการวิเคราะห์'); asset_name=st.selectbox('สินทรัพย์',list(ASSETS.keys()),index=0); symbol=ASSETS[asset_name]; chart_tf=st.selectbox('Timeframe กราฟ',list(TF.keys()),index=1); outputsize=st.slider('จำนวนแท่ง',250,800,400,50); auto=st.checkbox('Auto refresh',False); refresh=st.slider('รอบรีเฟรช (วินาที)',60,300,90,10)
+    st.header('ตั้งค่าการวิเคราะห์'); asset_name=st.selectbox('สินทรัพย์',list(ASSETS.keys()),index=0); symbol=ASSETS[asset_name]; chart_tf=st.selectbox('Timeframe กราฟ',list(TF.keys()),index=1); outputsize=st.slider('จำนวนแท่งที่แสดงบนกราฟ',250,FETCH_SIZE,400,50); auto=st.checkbox('Auto refresh',False); refresh=st.slider('รอบรีเฟรช (วินาที)',60,300,90,10)
     if st.button('รีเฟรชข้อมูลตอนนี้'):st.cache_data.clear();st.rerun()
-    st.divider(); show_signals=st.checkbox('แสดงจุด BUY/SELL บนกราฟ (ย้อนหลัง)',True); signal_threshold=st.slider('เกณฑ์คะแนนสัญญาณ',40,90,55,5) if show_signals else 55; signal_gap=st.slider('ระยะห่างขั้นต่ำระหว่างจุดสัญญาณ (แท่ง)',1,10,4,1) if show_signals else 4; show_zone=st.checkbox('แสดงโซน pullback',True); st.caption(f'API: Twelve Data • cache {CACHE_TTL}s • 5 requests/load')
+    st.divider(); show_signals=st.checkbox('แสดงจุด BUY/SELL บนกราฟ (ย้อนหลัง)',True); signal_threshold=st.slider('เกณฑ์คะแนนสัญญาณ',40,90,55,5) if show_signals else 55; signal_gap=st.slider('ระยะห่างขั้นต่ำระหว่างจุดสัญญาณ (แท่ง)',1,10,4,1) if show_signals else 4; show_zone=st.checkbox('แสดงโซน pullback',True); st.caption('API: Twelve Data • cache ตาม TF (5m=1น. • 15m=3น. • 1h=15น. • 4h=30น. • 1D=60น.) • สลับ BTC/ทอง ใช้ข้อมูลที่เก็บไว้ ไม่โหลดใหม่')
     st.divider(); st.subheader('คำนวณล็อต'); use_sizing=st.checkbox('แสดงล็อตที่เหมาะสมในการ์ด ENTRY READY',True)
     account_balance=st.number_input('ยอดพอร์ต (USD)',min_value=0.0,value=1000.0,step=100.0) if use_sizing else 0.0
     risk_pct=st.slider('ความเสี่ยงต่อไม้ (% ของพอร์ต)',0.25,3.0,1.0,0.25,help='มืออาชีพส่วนใหญ่ใช้ราว 0.5–2% ต่อไม้ — ยิ่งต่ำ พอร์ตยิ่งทนช่วงแพ้ติดกันได้') if use_sizing else 1.0
@@ -313,9 +335,10 @@ with st.sidebar:
 if auto:st.markdown(f'<meta http-equiv="refresh" content="{refresh}">',unsafe_allow_html=True)
 frames,raws,errors,stale={},{},{},{}
 for label in ['1D','4h','1h','15m','5m']:
-    raw,err=get_ohlcv(symbol,TF[label],outputsize); raws[label]=raw if raw is not None else pd.DataFrame(); frames[label]=indicators(closed_only(raws[label])) if not raws[label].empty else pd.DataFrame()
+    raw,err=get_ohlcv(symbol,TF[label]); raws[label]=raw if raw is not None else pd.DataFrame(); frames[label]=indicators(closed_only(raws[label])) if not raws[label].empty else pd.DataFrame()
     if err:errors[label]=err; stale[label]=err if raw is not None and not raw.empty else None
 chart=frames.get(chart_tf,pd.DataFrame()); have_all=all(not frames[x].empty for x in ['1D','4h','1h','15m','5m'])
+if not chart.empty: chart=chart.tail(outputsize)  # ตัดแท่งตามสไลเดอร์ (indicator คำนวณจากข้อมูลเต็มแล้ว)
 if errors:
     hard={k:v for k,v in errors.items() if stale.get(k) is None}; soft={k:v for k,v in errors.items() if stale.get(k) is not None}
     if soft:st.warning('บางไทม์เฟรมใช้ข้อมูลล่าสุดที่แคชไว้: '+' | '.join(f'{k}: {v}' for k,v in soft.items()))
