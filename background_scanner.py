@@ -8,32 +8,24 @@ import requests
 
 BASE='https://api.twelvedata.com'
 ASSETS={'Bitcoin BTC/USD':'BTC/USD','Gold XAU/USD':'XAU/USD'}
-TF={'1D':'1day','4h':'4h','1h':'1h','15m':'15min','5m':'5min'}
+TF={'1D':'1day','4h':'4h','1h':'1h','15m':'15min'}
 TOKEN=os.getenv('LINE_CHANNEL_ACCESS_TOKEN','').strip()
 USER_ID=os.getenv('LINE_USER_ID','').strip()
 API_KEY=os.getenv('TWELVEDATA_API_KEY','').strip()
 STATE=Path('alert_state.json')
 
-# Scan only during Alberta (Mountain Time) daytime hours. zoneinfo tracks
-# MST/MDT switchovers automatically, so this stays correct at 3AM/10PM local
-# time year-round without any manual UTC math.
 ACTIVE_TZ=ZoneInfo('America/Edmonton')
-ACTIVE_START=(4,0)     # 4:00 AM
-ACTIVE_END=(21,30)     # 9:30 PM (window is [4:00, 21:30) local time)
+ACTIVE_START=(4,0)
+ACTIVE_END=(21,30)
 
 def within_active_window():
     now=datetime.now(ACTIVE_TZ)
     mins=now.hour*60+now.minute
     return ACTIVE_START[0]*60+ACTIVE_START[1] <= mins < ACTIVE_END[0]*60+ACTIVE_END[1]
 
-# Free-plan Twelve Data key: 8 credits/minute, shared across BOTH assets in
-# this run AND anything else using the same key (e.g. the Streamlit app, if
-# open at the same time). Track every call's timestamp in a rolling 60s
-# window and wait before any call that would push the count over the cap,
-# with margin to spare (cap at 6, not 8, since timing/clock jitter on a
-# GitHub Actions runner can shift a call across the window boundary).
 _CALL_TIMES=[]
 MAX_CALLS_PER_MIN=6
+NOTIFY_COOLDOWN_MIN=45
 
 def _pace():
     now=time.monotonic()
@@ -96,21 +88,11 @@ def setup(d,direction):
     br=x.close<lo and x.close<x.open and x.body_ratio>=0.30
     ok=pull or sweep or br; return bool(ok), min(100,62+8*sum([pull,sweep,br])), 'M15 pullback/sweep/breakdown' if ok else 'wait'
 
-def trigger(d,direction):
-    if len(d)<50 or direction=='NEUTRAL': return False,0
-    x,p=d.iloc[-1],d.iloc[-2]; rg=max(float(x.range),1e-9)
-    if direction=='LONG':
-        br=x.close>p.high and x.close>x.open and x.body_ratio>=0.20; rec=x.close>x.EMA20 and p.close<=p.EMA20 and x.close>x.open; rej=x.lower_wick>=0.20*rg and x.close>x.open and x.close>=x.low+0.55*rg
-    else:
-        br=x.close<p.low and x.close<x.open and x.body_ratio>=0.20; rec=x.close<x.EMA20 and p.close>=p.EMA20 and x.close<x.open; rej=x.upper_wick>=0.20*rg and x.close<x.open and x.close<=x.high-0.55*rg
-    score=min(100,40*int(br)+35*int(rec)+25*int(rej)); ok=(br or rec or rej) and score>=55
-    return bool(ok),int(score)
-
 def plan(fr,direction,mode):
-    m5,m15,h1=fr['5m'],fr['15m'],fr['1h']; entry=float(m5.close.iloc[-1] if mode=='Short Hold' else m15.close.iloc[-1]); atr=float(m5.ATR.iloc[-1] if mode=='Short Hold' else m15.ATR.iloc[-1])
+    m15,h1=fr['15m'],fr['1h']; entry=float(m15.close.iloc[-1]); atr=float(m15.ATR.iloc[-1])
     if mode=='Short Hold':
         min_r,maxr=1.0*atr,2.8*atr
-        sl=(float(m5.tail(12).low.min())-0.25*atr) if direction=='LONG' else (float(m5.tail(12).high.max())+0.25*atr)
+        sl=(float(m15.tail(12).low.min())-0.25*atr) if direction=='LONG' else (float(m15.tail(12).high.max())+0.25*atr)
         r=entry-sl if direction=='LONG' else sl-entry
         if 0<r<min_r:
             r=min_r; sl=entry-r if direction=='LONG' else entry+r
@@ -140,25 +122,24 @@ def scan_asset(name,symbol):
     fr={}
     for label in TF:
         fr[label]=ind(fetch(symbol,TF[label]))
-    d1,h4,h1,m15,m5=[state(fr[x]) for x in ('1D','4h','1h','15m','5m')]
-    print(f"[STATE] {name}: D1={d1} H4={h4} H1={h1} M15={m15} M5={m5}")
+    d1,h4,h1,m15=[state(fr[x]) for x in ('1D','4h','1h','15m')]
+    print(f"[STATE] {name}: D1={d1} H4={h4} H1={h1} M15={m15}")
     if d1[0] not in ('LONG','SHORT') or not (h4[0]==h1[0]==m15[0]==d1[0]) or d1[1]<60: return []
     direction=d1[0]
     ok_setup,s_score,s_name=setup(fr['15m'],direction)
-    ok_trig,t_score=trigger(fr['5m'],direction)
 
-    print(f"[CHECK] {name}: setup={ok_setup} score={s_score} name={s_name} trigger={ok_trig} score={t_score}")
+    print(f"[CHECK] {name}: setup={ok_setup} score={s_score} name={s_name}")
 
     alerts=[]
 
     for mode in ('Short Hold','Long Hold'):
-        ready=ok_setup and ok_trig
+        ready=ok_setup
 
         p=plan(fr,direction,mode) if ready else None
 
         if p:
             entry,sl,tp1,tp2=p
-            candle=str(fr['5m'].index[-1])
+            candle=str(fr['15m'].index[-1])
 
             sig=f'{symbol}|{mode}|{direction}|{candle}|{round(entry,4)}|{round(sl,4)}'
 
@@ -169,8 +150,7 @@ def scan_asset(name,symbol):
                 f'SL: {sl:.4f}\n'
                 f'TP1: {tp1:.4f}\n'
                 f'TP2: {tp2:.4f}\n'
-                f'Setup: {s_name} ({s_score})\n'
-                f'Trigger: {t_score}'
+                f'Setup: {s_name} ({s_score})'
             )
 
             alerts.append((sig,msg))
@@ -189,14 +169,24 @@ def main():
         return
     if not all([API_KEY,TOKEN,USER_ID]): raise SystemExit('Missing TWELVEDATA_API_KEY / LINE_CHANNEL_ACCESS_TOKEN / LINE_USER_ID')
     state=load_state(); changed=False
+    cooldown=state.setdefault('_cooldown',{})
+    now=time.time()
     for name,symbol in ASSETS.items():
         try: alerts=scan_asset(name,symbol)
         except Exception as e: print(f'{name}: {e}'); continue
         for sig,msg in alerts:
-            if sig not in state:
-                push(msg); state[sig]=True; changed=True; print('sent',sig)
-    # Keep state bounded.
-    if len(state)>500: state=dict(list(state.items())[-300:]); changed=True
+            if sig in state: continue
+            sym,mode,direction=sig.split('|')[:3]
+            ckey=f'{sym}|{mode}|{direction}'
+            last=cooldown.get(ckey)
+            if last is not None and (now-last)<NOTIFY_COOLDOWN_MIN*60:
+                mins_left=int((NOTIFY_COOLDOWN_MIN*60-(now-last))/60)+1
+                print(f'[COOLDOWN] skip {ckey} ({mins_left} min left)')
+                continue
+            push(msg); state[sig]=True; cooldown[ckey]=now; changed=True; print('sent',sig)
+    sig_items=[(k,v) for k,v in state.items() if k!='_cooldown']
+    if len(sig_items)>500:
+        state={k:v for k,v in sig_items[-300:]}; state['_cooldown']=cooldown; changed=True
     if changed: save_state(state)
 
 if __name__=='__main__': main()
