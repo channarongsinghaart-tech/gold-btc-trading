@@ -8,11 +8,10 @@ import plotly.graph_objects as go
 st.set_page_config(page_title='Gold & Bitcoin Trading Analyzer V4.7', page_icon='📈', layout='wide')
 BASE='https://api.twelvedata.com'
 ASSETS={'Bitcoin BTC/USD':'BTC/USD','Gold XAU/USD':'XAU/USD'}
-TF={'5m':'5min','15m':'15min','1h':'1h','4h':'4h','1D':'1day'}
-# อายุ cache ตาม timeframe (วินาที) — TF ใหญ่แท่งเปลี่ยนช้า ไม่ต้องดึงใหม่บ่อย
-TTL_BY_TF={'5min':60,'15min':180,'1h':900,'4h':1800,'1day':3600}
-FETCH_SIZE=500          # ดึงขนาดเดียวเสมอ แล้วค่อยตัดแท่งตามสไลเดอร์ตอนแสดงกราฟ
-MAX_CALLS_PER_MIN=7     # Twelve Data แผนฟรี ~8/นาที เหลือ buffer 1
+TF={'15m':'15min','1h':'1h','4h':'4h','1D':'1day'}
+TTL_BY_TF={'15min':180,'1h':900,'4h':1800,'1day':3600}
+FETCH_SIZE=500
+MAX_CALLS_PER_MIN=7
 API_KEY=os.getenv('TWELVEDATA_API_KEY','')
 LINE_TOKEN_DEFAULT=os.getenv('LINE_CHANNEL_ACCESS_TOKEN','')
 LINE_USER_ID_DEFAULT=os.getenv('LINE_USER_ID','')
@@ -22,15 +21,13 @@ try:
     if not LINE_USER_ID_DEFAULT and 'LINE_USER_ID' in st.secrets: LINE_USER_ID_DEFAULT=str(st.secrets['LINE_USER_ID'])
 except Exception: pass
 
-# Streamlit รันสคริปต์ใหม่ทุก rerun ตัวแปร global ธรรมดาจึงถูกรีเซ็ตทุกครั้ง
-# ใช้ cache_resource เก็บสถานะที่ต้องอยู่ข้าม rerun / ข้ามการสลับสินทรัพย์
 @st.cache_resource
 def _shared_state():
     return {'last_good':{},'notified':{},'calls':[]}
 _S=_shared_state()
-_LAST_GOOD=_S['last_good']       # {(symbol,interval): DataFrame ล่าสุดที่โหลดสำเร็จ}
-_LAST_NOTIFIED=_S['notified']    # {(symbol,mode): signature} กันส่ง LINE ซ้ำ
-_CALL_TIMES=_S['calls']          # เวลาที่ยิง API ล่าสุด (กันเกินลิมิตต่อนาที)
+_LAST_GOOD=_S['last_good']
+_LAST_NOTIFIED=_S['notified']
+_CALL_TIMES=_S['calls']
 
 def _pace_requests():
     now=time.monotonic()
@@ -58,8 +55,6 @@ def api_get(endpoint,params):
 
 @st.cache_data(ttl=7200,max_entries=40,show_spinner=False)
 def _fetch_ohlcv(symbol,interval,outputsize,bucket):
-    # bucket ทำให้ cache หมดอายุตาม TTL ของแต่ละ TF
-    # ถ้า error จะ raise ซึ่ง st.cache_data ไม่เก็บผลที่ error ไว้
     data,err=api_get('time_series',{'symbol':symbol,'interval':interval,'outputsize':outputsize,'apikey':API_KEY,'timezone':'UTC'})
     if err: raise RuntimeError(err)
     if not data or 'values' not in data: raise RuntimeError((data or {}).get('message','ไม่มีข้อมูล'))
@@ -154,24 +149,6 @@ def m15_setup(d,direction):
     x=d.iloc[-1]; atr=max(float(x.ATR),1e-9); near=abs(float(x.close)-float(x.EMA20))/atr<=1.25
     return {'ok':False,'near':near,'score':52 if near else 35,'name':'M15 ใกล้ setup zone' if near else 'รอ M15 pullback / breakout / sweep / continuation','type':'NEAR' if near else 'NONE'}
 
-def m5_trigger(d,direction):
-    if d is None or len(d)<50 or direction=='NEUTRAL':return {'ok':False,'score':0,'name':'รอ M5 trigger','type':'NONE'}
-    candidates=[]
-    for off in (0,1,2):
-        sub=d if off==0 else d.iloc[:-off]
-        if len(sub)<25:continue
-        x,p=sub.iloc[-1],sub.iloc[-2]; rg=max(float(x.range),1e-9)
-        bb=x.close>p.high and x.close>x.open and x.body_ratio>=.20; bd=x.close<p.low and x.close<x.open and x.body_ratio>=.20
-        br=x.close>x.EMA20 and p.close<=p.EMA20 and x.close>x.open; sr=x.close<x.EMA20 and p.close>=p.EMA20 and x.close<x.open
-        bj=x.lower_wick>=.20*rg and x.close>x.open and x.close>=x.low+.55*rg; sj=x.upper_wick>=.20*rg and x.close<x.open and x.close<=x.high-.55*rg
-        if direction=='LONG':score=min(100,40*int(bb)+35*int(br)+25*int(bj)); name='M5 bullish trigger'
-        else:score=min(100,40*int(bd)+35*int(sr)+25*int(sj)); name='M5 bearish trigger'
-        candidates.append((off,score,name))
-    q=[c for c in candidates if c[1]>=55]
-    if q:
-        _,score,name=min(q,key=lambda c:c[0]); return {'ok':True,'score':int(score),'name':name,'type':direction}
-    _,score,_=max(candidates,key=lambda c:c[1]); return {'ok':False,'score':int(score),'name':'รอ M5 กลับขึ้น' if direction=='LONG' else 'รอ M5 กลับลง','type':'NONE'}
-
 def scan_signals(d,threshold=55,min_gap=4):
     buys=[]; sells=[]; last_state=None; last_i=-10**9
     if d is None or len(d)<2:return buys,sells
@@ -200,18 +177,18 @@ def range_location(h4,h1,direction):
     return {'score':55,'zone':'MID RANGE','reason':'H4/H1 อยู่กลาง range'}
 
 def make_plan(frames,direction,mode):
-    m5,m15,h1=frames['5m'],frames['15m'],frames['1h']
+    m15,h1=frames['15m'],frames['1h']
     if direction=='NEUTRAL':return None
-    atr5=max(float(m5.ATR.iloc[-1]),1e-9); atr15=max(float(m15.ATR.iloc[-1]),1e-9); entry=float(m5.close.iloc[-1])
+    atr15=max(float(m15.ATR.iloc[-1]),1e-9); entry=float(m15.close.iloc[-1])
     if mode=='Short Hold':
-        risk_min,risk_max=atr5,2.8*atr5
-        if direction=='LONG':sl=float(m5.tail(12).low.min())-.25*atr5; risk=entry-sl
-        else:sl=float(m5.tail(12).high.max())+.25*atr5; risk=sl-entry
+        risk_min,risk_max=atr15,2.8*atr15
+        if direction=='LONG':sl=float(m15.tail(12).low.min())-.25*atr15; risk=entry-sl
+        else:sl=float(m15.tail(12).high.max())+.25*atr15; risk=sl-entry
         if 0<risk<risk_min:risk=risk_min;sl=entry-risk if direction=='LONG' else entry+risk
         if risk<=0 or risk>risk_max:return None
         tp1,tp2=(entry+1.2*risk,entry+1.8*risk) if direction=='LONG' else (entry-1.2*risk,entry-1.8*risk)
     else:
-        entry=float(m15.close.iloc[-1]); risk_min,risk_max=1.2*atr15,5*atr15
+        risk_min,risk_max=1.2*atr15,5*atr15
         if direction=='LONG':sl=min(float(m15.tail(14).low.min()),float(h1.tail(10).low.min()))-.30*atr15; risk=entry-sl
         else:sl=max(float(m15.tail(14).high.max()),float(h1.tail(10).high.max()))+.30*atr15; risk=sl-entry
         if 0<risk<risk_min:risk=risk_min;sl=entry-risk if direction=='LONG' else entry+risk
@@ -221,36 +198,35 @@ def make_plan(frames,direction,mode):
 
 def evaluate(frames,mode):
     ctx=macro_context(frames['1D'],frames['4h'],frames['1h'],frames['15m']); macro=ctx['macro']; tactical=ctx['tactical']; MIN_MACRO_SCORE=60
-    # Trend-following gate: D1/H4/H1/M15 must all agree before ENTRY READY.
     full_align=(macro in ('LONG','SHORT') and ctx['d1']['bias']==macro and ctx['h4']['bias']==macro and ctx['h1']['bias']==macro and ctx['m15']['bias']==macro)
     counter=macro in ('LONG','SHORT') and tactical in ('LONG','SHORT') and tactical!=macro
-    short_dir=macro; short_loc=range_location(frames['4h'],frames['1h'],short_dir); short_setup=m15_setup(frames['15m'],short_dir); short_trig=m5_trigger(frames['5m'],short_dir)
-    long_dir=macro; long_loc=range_location(frames['4h'],frames['1h'],long_dir); long_setup=m15_setup(frames['15m'],long_dir); long_trig=m5_trigger(frames['5m'],long_dir)
+    short_dir=macro; short_loc=range_location(frames['4h'],frames['1h'],short_dir); short_setup=m15_setup(frames['15m'],short_dir)
+    long_dir=macro; long_loc=range_location(frames['4h'],frames['1h'],long_dir); long_setup=m15_setup(frames['15m'],long_dir)
     if mode=='Short Hold':
-        direction,setup,trig,loc=short_dir,short_setup,short_trig,short_loc
+        direction,setup,loc=short_dir,short_setup,short_loc
         if macro=='NEUTRAL':status='WAIT';entry_class='WAIT';reason='D1/H4 ยังไม่ให้ Macro direction'
         elif ctx['macro_strength']<MIN_MACRO_SCORE:status='WAIT';entry_class='WAIT';reason=f'Macro Strength {ctx["macro_strength"]}/100 ต่ำกว่าเกณฑ์ {MIN_MACRO_SCORE} — รอ Macro แข็งแรงขึ้น'
-        elif not full_align:status='PRE-ENTRY' if (setup['ok'] or setup['near']) else 'WAIT';entry_class='PULLBACK / RESUME';reason=f'Macro {macro} • Tactical {tactical} • รอ D1/H4/H1/M15 align และ M5 trigger • {setup["name"]} • {trig["name"]}'
-        elif setup['ok'] and trig['ok']:status='ENTRY READY';entry_class='TREND ENTRY';reason=f'Trend aligned • {setup["name"]} • {trig["name"]} • {loc["zone"]}'
-        elif setup['ok'] or setup['near']:status='PRE-ENTRY';entry_class='TREND WATCH';reason=f'{setup["name"]} • {trig["name"]} • {loc["reason"]}'
+        elif not full_align:status='PRE-ENTRY' if (setup['ok'] or setup['near']) else 'WAIT';entry_class='PULLBACK / RESUME';reason=f'Macro {macro} • Tactical {tactical} • รอ D1/H4/H1/M15 align • {setup["name"]}'
+        elif setup['ok']:status='ENTRY READY';entry_class='TREND ENTRY';reason=f'Trend aligned • {setup["name"]} • {loc["zone"]}'
+        elif setup['near']:status='PRE-ENTRY';entry_class='TREND WATCH';reason=f'{setup["name"]} • {loc["reason"]}'
         else:status='WAIT';entry_class='WAIT';reason=setup['name']
     else:
-        direction,setup,trig,loc=long_dir,long_setup,long_trig,long_loc
+        direction,setup,loc=long_dir,long_setup,long_loc
         if macro=='NEUTRAL':status='WAIT';entry_class='WAIT';reason='D1/H4 ยังไม่ให้ Macro direction'
         elif ctx['macro_strength']<MIN_MACRO_SCORE:status='WAIT';entry_class='WAIT';reason=f'Macro Strength {ctx["macro_strength"]}/100 ต่ำกว่าเกณฑ์ {MIN_MACRO_SCORE} — รอ Macro แข็งแรงขึ้น'
-        elif not full_align:status='PRE-ENTRY' if (setup['ok'] or setup['near']) else 'WAIT';entry_class='PULLBACK / RESUME';reason=f'Macro {macro} • Tactical {tactical} • รอ D1/H4/H1/M15 align และ M5 trigger • {setup["name"]} • {trig["name"]}'
-        elif setup['ok'] and trig['ok']:status='ENTRY READY';entry_class='TREND ENTRY';reason=f'Trend aligned • {setup["name"]} • {trig["name"]} • {loc["zone"]}'
-        elif setup['ok'] or setup['near']:status='PRE-ENTRY';entry_class='TREND WATCH';reason=f'{setup["name"]} • {trig["name"]} • {loc["reason"]}'
+        elif not full_align:status='PRE-ENTRY' if (setup['ok'] or setup['near']) else 'WAIT';entry_class='PULLBACK / RESUME';reason=f'Macro {macro} • Tactical {tactical} • รอ D1/H4/H1/M15 align • {setup["name"]}'
+        elif setup['ok']:status='ENTRY READY';entry_class='TREND ENTRY';reason=f'Trend aligned • {setup["name"]} • {loc["zone"]}'
+        elif setup['near']:status='PRE-ENTRY';entry_class='TREND WATCH';reason=f'{setup["name"]} • {loc["reason"]}'
         else:status='WAIT';entry_class='WAIT';reason=setup['name']
-    readiness=int(np.clip(.30*ctx['macro_strength']+.25*ctx['tactical_strength']+.20*setup['score']+.15*trig['score']+.10*loc['score'],0,100))
+    readiness=int(np.clip(.35*ctx['macro_strength']+.30*ctx['tactical_strength']+.25*setup['score']+.10*loc['score'],0,100))
     plan=make_plan(frames,direction,mode) if status=='ENTRY READY' else None
     if status=='ENTRY READY' and plan is None:status='PRE-ENTRY';entry_class='TREND WATCH';reason='สัญญาณครบ แต่โครงสร้าง SL กว้างเกินไป — รอราคาเข้าโครงสร้างใหม่'
     relation='ALIGNED' if full_align else 'COUNTER-MACRO' if counter else 'MIXED'
-    return {'status':status,'direction':direction,'macro':macro,'tactical':tactical,'macro_strength':ctx['macro_strength'],'tactical_strength':ctx['tactical_strength'],'relation':relation,'entry_class':entry_class,'trend_d1':ctx['d1']['score'],'h4_score':ctx['h4']['score'],'h1_score':ctx['h1']['score'],'alignment':int(round((ctx['h4']['score']+ctx['h1']['score'])/2)),'setup':setup,'trigger':trig,'range':range_info(frames['15m']),'location':loc,'readiness':readiness,'plan':plan,'reason':reason,'states':ctx}
+    return {'status':status,'direction':direction,'macro':macro,'tactical':tactical,'macro_strength':ctx['macro_strength'],'tactical_strength':ctx['tactical_strength'],'relation':relation,'entry_class':entry_class,'trend_d1':ctx['d1']['score'],'h4_score':ctx['h4']['score'],'h1_score':ctx['h1']['score'],'alignment':int(round((ctx['h4']['score']+ctx['h1']['score'])/2)),'setup':setup,'range':range_info(frames['15m']),'location':loc,'readiness':readiness,'plan':plan,'reason':reason,'states':ctx}
 
 def fmt(v):return '—' if v is None or not np.isfinite(v) else f'{v:,.2f}'
 
-CONTRACT_SIZE={'BTC/USD':1.0,'XAU/USD':100.0}  # units per 1.00 lot (checked against broker history: XAU 100 oz, BTC 1 BTC)
+CONTRACT_SIZE={'BTC/USD':1.0,'XAU/USD':100.0}
 
 def notify_line(token,message,user_id=None):
     url='https://api.line.me/v2/bot/message/push' if user_id else 'https://api.line.me/v2/bot/message/broadcast'
@@ -271,7 +247,7 @@ def maybe_notify_entry(token,symbol,mode,r,sizing,user_id=None):
     p=r['plan']
     sig=(symbol,mode,r['direction'],round(p['entry'],2),round(p['sl'],2))
     key=(symbol,mode)
-    if _LAST_NOTIFIED.get(key)==sig:return None  # already notified this exact signal, skip
+    if _LAST_NOTIFIED.get(key)==sig:return None
     lines=[f"🔔 {symbol} {mode} — ENTRY READY {r['direction']}",
            f"Entry {fmt(p['entry'])} | SL {fmt(p['sl'])}",
            f"TP1 {fmt(p['tp1'])} | TP2 {fmt(p['tp2'])} | R:R {p['rr']:.2f}R"]
@@ -283,7 +259,6 @@ def maybe_notify_entry(token,symbol,mode,r,sizing,user_id=None):
     return ok,err
 
 def position_size(balance,risk_pct,entry,sl,contract,step=0.01):
-    """Lot size so that hitting SL loses ~risk_pct of balance. Rounds DOWN to the lot step, never up."""
     dist=abs(entry-sl)
     if balance<=0 or risk_pct<=0 or dist<=0 or contract<=0:return None
     target=balance*risk_pct/100.0
@@ -296,9 +271,9 @@ def render_card(r,title,sizing=None):
     ready=r['status']=='ENTRY READY'; pre=r['status']=='PRE-ENTRY'; icon='🟢' if ready and r['direction']=='LONG' else '🔴' if ready and r['direction']=='SHORT' else '🟡'
     st.markdown(f'### {title}'); st.markdown(f'**{icon} {r["status"]} — {r["direction"]}**')
     if r['entry_class']=='PULLBACK / RESUME':st.info('PULLBACK / RESUME — Macro กับ Tactical/TF ย่อยยังไม่ align ครบ จึงยังไม่ถือเป็น entry')
-    elif r['entry_class']=='TREND ENTRY':st.caption('TREND ENTRY — D1/H4/H1/M15 aligned และ M15/M5 confirmation ครบ')
+    elif r['entry_class']=='TREND ENTRY':st.caption('TREND ENTRY — D1/H4/H1/M15 aligned และ M15 setup confirmation ครบ')
     a,b,c=st.columns(3); a.metric('Macro D1/H4',f'{r["macro"]} {r["macro_strength"]}/100'); b.metric('Tactical H1/M15',f'{r["tactical"]} {r["tactical_strength"]}/100'); c.metric('Setup Readiness',f'{r["readiness"]}/100')
-    st.caption(f'Signal Class: {r["entry_class"]} • Macro {r["macro"]} • Tactical {r["tactical"]} • {r["relation"]} • H4/H1 {r["location"]["zone"]} • M15 {r["setup"]["name"]} • M5 {r["trigger"]["name"]}')
+    st.caption(f'Signal Class: {r["entry_class"]} • Macro {r["macro"]} • Tactical {r["tactical"]} • {r["relation"]} • H4/H1 {r["location"]["zone"]} • M15 {r["setup"]["name"]}')
     st.info(('PRE-ENTRY: ' if pre else 'ENTRY READY: ' if ready else 'WAIT: ')+r['reason'])
     if ready and r['plan']:
         p=r['plan']; a,b,c,d=st.columns(4); a.metric('Entry',fmt(p['entry'])); b.metric('SL',fmt(p['sl'])); c.metric('TP1',fmt(p['tp1'])); d.metric('TP2',fmt(p['tp2'])); st.caption(f'R:R to TP2 ≈ {p["rr"]:.2f}R')
@@ -312,12 +287,12 @@ def render_card(r,title,sizing=None):
                 st.caption(f"ยึดความเสี่ยง {sizing['risk_pct']:g}% ของพอร์ต ${sizing['balance']:,.0f} • 1 สัญญาณ = 1 ไม้ ห้ามเพิ่มไม้ทับขณะติดลบ • ปิดครึ่งที่ TP1 แล้วเลื่อน SL มาที่ราคาเข้า")
     else:st.caption('ยังไม่แสดง Entry / SL / TP จนกว่าจะเกิด ENTRY READY')
 
-st.title('Gold & Bitcoin Trading Analyzer — V4.7')
-st.caption('D1 trend → H4 → H1 → M15 setup → M5 trigger. Short Hold และ Long Hold แสดงพร้อมกัน • Trend-following only')
+st.title('Gold & Bitcoin Trading Analyzer — V4.9')
+st.caption('D1 trend → H4 → H1 → M15 setup (จุดเข้าในตัว). Short Hold และ Long Hold แสดงพร้อมกัน • Trend-following only')
 with st.sidebar:
-    st.header('ตั้งค่าการวิเคราะห์'); asset_name=st.selectbox('สินทรัพย์',list(ASSETS.keys()),index=0); symbol=ASSETS[asset_name]; chart_tf=st.selectbox('Timeframe กราฟ',list(TF.keys()),index=1); outputsize=st.slider('จำนวนแท่งที่แสดงบนกราฟ',250,FETCH_SIZE,400,50); auto=st.checkbox('Auto refresh',False); refresh=st.slider('รอบรีเฟรช (วินาที)',60,300,90,10)
+    st.header('ตั้งค่าการวิเคราะห์'); asset_name=st.selectbox('สินทรัพย์',list(ASSETS.keys()),index=0); symbol=ASSETS[asset_name]; chart_tf=st.selectbox('Timeframe กราฟ',list(TF.keys()),index=0); outputsize=st.slider('จำนวนแท่งที่แสดงบนกราฟ',250,FETCH_SIZE,400,50); auto=st.checkbox('Auto refresh',False); refresh=st.slider('รอบรีเฟรช (วินาที)',60,300,90,10)
     if st.button('รีเฟรชข้อมูลตอนนี้'):st.cache_data.clear();st.rerun()
-    st.divider(); show_signals=st.checkbox('แสดงจุด BUY/SELL บนกราฟ (ย้อนหลัง)',True); signal_threshold=st.slider('เกณฑ์คะแนนสัญญาณ',40,90,55,5) if show_signals else 55; signal_gap=st.slider('ระยะห่างขั้นต่ำระหว่างจุดสัญญาณ (แท่ง)',1,10,4,1) if show_signals else 4; show_zone=st.checkbox('แสดงโซน pullback',True); st.caption('API: Twelve Data • cache ตาม TF (5m=1น. • 15m=3น. • 1h=15น. • 4h=30น. • 1D=60น.) • สลับ BTC/ทอง ใช้ข้อมูลที่เก็บไว้ ไม่โหลดใหม่')
+    st.divider(); show_signals=st.checkbox('แสดงจุด BUY/SELL บนกราฟ (ย้อนหลัง)',True); signal_threshold=st.slider('เกณฑ์คะแนนสัญญาณ',40,90,55,5) if show_signals else 55; signal_gap=st.slider('ระยะห่างขั้นต่ำระหว่างจุดสัญญาณ (แท่ง)',1,10,4,1) if show_signals else 4; show_zone=st.checkbox('แสดงโซน pullback',True); st.caption('API: Twelve Data • cache ตาม TF (15m=3น. • 1h=15น. • 4h=30น. • 1D=60น.) • สลับ BTC/ทอง ใช้ข้อมูลที่เก็บไว้ ไม่โหลดใหม่ • โหลดต่อครั้ง 4 requests (D1/H4/H1/M15)')
     st.divider(); st.subheader('คำนวณล็อต'); use_sizing=st.checkbox('แสดงล็อตที่เหมาะสมในการ์ด ENTRY READY',True)
     account_balance=st.number_input('ยอดพอร์ต (USD)',min_value=0.0,value=1000.0,step=100.0) if use_sizing else 0.0
     risk_pct=st.slider('ความเสี่ยงต่อไม้ (% ของพอร์ต)',0.25,3.0,1.0,0.25,help='มืออาชีพส่วนใหญ่ใช้ราว 0.5–2% ต่อไม้ — ยิ่งต่ำ พอร์ตยิ่งทนช่วงแพ้ติดกันได้') if use_sizing else 1.0
@@ -334,17 +309,17 @@ with st.sidebar:
                 st.success('ส่งสำเร็จ ลองเช็ค LINE ดูได้เลย') if _ok else st.error(f'ส่งไม่สำเร็จ: {_err}')
 if auto:st.markdown(f'<meta http-equiv="refresh" content="{refresh}">',unsafe_allow_html=True)
 frames,raws,errors,stale={},{},{},{}
-for label in ['1D','4h','1h','15m','5m']:
+for label in ['1D','4h','1h','15m']:
     raw,err=get_ohlcv(symbol,TF[label]); raws[label]=raw if raw is not None else pd.DataFrame(); frames[label]=indicators(closed_only(raws[label])) if not raws[label].empty else pd.DataFrame()
     if err:errors[label]=err; stale[label]=err if raw is not None and not raw.empty else None
-chart=frames.get(chart_tf,pd.DataFrame()); have_all=all(not frames[x].empty for x in ['1D','4h','1h','15m','5m'])
-if not chart.empty: chart=chart.tail(outputsize)  # ตัดแท่งตามสไลเดอร์ (indicator คำนวณจากข้อมูลเต็มแล้ว)
+chart=frames.get(chart_tf,pd.DataFrame()); have_all=all(not frames[x].empty for x in ['1D','4h','1h','15m'])
+if not chart.empty: chart=chart.tail(outputsize)
 if errors:
     hard={k:v for k,v in errors.items() if stale.get(k) is None}; soft={k:v for k,v in errors.items() if stale.get(k) is not None}
     if soft:st.warning('บางไทม์เฟรมใช้ข้อมูลล่าสุดที่แคชไว้: '+' | '.join(f'{k}: {v}' for k,v in soft.items()))
     if hard:st.error(' | '.join(f'{k}: {v}' for k,v in hard.items()))
 if chart.empty:st.error('ไม่มีข้อมูลสำหรับกราฟ/ราคาปัจจุบัน');st.stop()
-price_src=frames.get('5m') if not frames.get('5m',pd.DataFrame()).empty else chart; price=float(price_src.close.iloc[-1]); prev=float(price_src.close.iloc[-2]) if len(price_src)>1 else price; st.subheader(asset_name);st.metric('Price',fmt(price),f'{(price/prev-1)*100:+.2f}%' if prev else '0.00%')
+price_src=frames.get('15m') if not frames.get('15m',pd.DataFrame()).empty else chart; price=float(price_src.close.iloc[-1]); prev=float(price_src.close.iloc[-2]) if len(price_src)>1 else price; st.subheader(asset_name);st.metric('Price',fmt(price),f'{(price/prev-1)*100:+.2f}%' if prev else '0.00%')
 short=long=None
 st.markdown('## สถานะการเทรด')
 if have_all:
@@ -362,7 +337,7 @@ if have_all:
                 st.toast(f'ส่งแจ้งเตือน LINE ({mode_name}) แล้ว' if ok else f'ส่งแจ้งเตือน LINE ไม่สำเร็จ: {err}', icon='🔔' if ok else '⚠️')
 else:st.info('ข้อมูลบางไทม์เฟรมยังไม่พร้อม — รอแล้วรีเฟรชใหม่')
 st.markdown('## โครงสร้างตลาด'); rows=[]
-for tf in ['1D','4h','1h','15m','5m']:
+for tf in ['1D','4h','1h','15m']:
     d=frames[tf]
     if d.empty:rows.append({'TF':tf,'Bias':'—','Trend':'—','Structure':'—','Range':'—','Range High':'—','Range Low':'—'});continue
     s=tf_state(d);rg=range_info(d);rows.append({'TF':tf,'Bias':s['bias'],'Trend':s['score'],'Structure':s['structure'],'Range':rg['zone'],'Range High':rg['high'],'Range Low':rg['low']})
@@ -373,8 +348,6 @@ if show_signals:
     buys,sells=scan_signals(chart,signal_threshold,signal_gap)
     if buys:fig.add_trace(go.Scatter(x=[x['time'] for x in buys],y=[x['price'] for x in buys],mode='markers',name='BUY',marker=dict(symbol='triangle-up',size=11,color='#22c55e'),text=[f"BUY {x['score']}%" for x in buys],hovertemplate='%{text}<br>%{y}<extra></extra>'))
     if sells:fig.add_trace(go.Scatter(x=[x['time'] for x in sells],y=[x['price'] for x in sells],mode='markers',name='SELL',marker=dict(symbol='triangle-down',size=11,color='#ef4444'),text=[f"SELL {x['score']}%" for x in sells],hovertemplate='%{text}<br>%{y}<extra></extra>'))
-# Trade plan lines: only show Entry/SL/TP when the decision card has an actual ENTRY READY plan.
-# The green/red pullback box remains a zone; it is not itself an order level.
 if short or long:
     plans=[]
     if short and short.get('status')=='ENTRY READY' and short.get('plan'):
@@ -404,9 +377,6 @@ if show_zone and len(chart)>20 and short and long:
             if res['direction'] in ('LONG','SHORT'):zones.append((res['direction'],label));break
     last=chart.iloc[-1]; e=float(last.EMA20); atr=float(last.ATR)
     if zones and np.isfinite(e) and np.isfinite(atr) and atr>0:
-        # xref='paper' ties the box to the visible plot width (0=left edge,
-        # 1=right edge) instead of a future data x-coordinate, so it never
-        # falls outside the view no matter how the chart is panned/zoomed.
         n=len(zones)
         for i,(zd,zl) in enumerate(zones):
             x0=i/n; x1=(i+1)/n-0.01; lc='#22c55e' if zd=='LONG' else '#ef4444'; fc='rgba(34,197,94,0.16)' if zd=='LONG' else 'rgba(239,68,68,0.16)'
@@ -416,4 +386,4 @@ fig.update_layout(height=520,xaxis_rangeslider_visible=False,margin=dict(l=10,r=
 if show_signals:st.caption('BUY/SELL บนกราฟเป็น raw candle markers เท่านั้น ไม่ได้ผ่าน Macro/Tactical gate และไม่ส่งคำสั่งจริง')
 if short or long:
     st.caption('กรอบเขียว/แดง = Entry Zone สำหรับเฝ้ารอ ไม่ใช่คำสั่งเข้าอัตโนมัติ • เส้น ENTRY/SL/TP1/TP2 จะขึ้นเมื่อระบบได้ ENTRY READY เท่านั้น')
-st.markdown('## หลักการของ V4.7');st.write('Trend-following only: D1/H4/H1/M15 ต้อง align กันก่อน ENTRY READY และ Macro Strength ต้อง ≥60. M15 เป็น setup และ M5 เป็น trigger. M5 trigger ใช้เฉพาะ breakout/reclaim/rejection points; ไม่มีคะแนนฟรีจาก volume หรือ EMA. Short Hold ไม่มี COUNTER-MACRO ENTRY. Long Hold ที่ TF ย่อยยังไม่ align จะแสดง PULLBACK / RESUME และยังไม่เป็น ENTRY READY. ระบบเป็น analyzer ไม่ส่งคำสั่งซื้อขายอัตโนมัติ')
+st.markdown('## หลักการของ V4.9');st.write('Trend-following only: D1/H4/H1/M15 ต้อง align กันก่อน ENTRY READY และ Macro Strength ต้อง ≥60. M15 เป็นทั้ง setup และจุดเข้าในตัวเดียว (ไม่มี M5/M30 trigger แยกแล้ว) ใช้ pullback/sweep/breakout/continuation บน M15 เอง. Short Hold ไม่มี COUNTER-MACRO ENTRY. Long Hold ที่ TF ย่อยยังไม่ align จะแสดง PULLBACK / RESUME และยังไม่เป็น ENTRY READY. ระบบเป็น analyzer ไม่ส่งคำสั่งซื้อขายอัตโนมัติ')
