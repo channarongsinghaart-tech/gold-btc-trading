@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 
 st.set_page_config(page_title='Gold & Bitcoin Trading Analyzer V4.7', page_icon='📈', layout='wide')
 BASE='https://api.twelvedata.com'
-ASSETS={'Bitcoin BTC/USD':'BTC/USD','Gold XAU/USD':'XAU/USD'}
+ASSETS={'Gold XAU/USD':'XAU/USD','Bitcoin BTC/USD':'BTC/USD'}
 TF={'15m':'15min','1h':'1h','4h':'4h','1D':'1day'}
 TTL_BY_TF={'15min':180,'1h':900,'4h':1800,'1day':3600}
 FETCH_SIZE=500
