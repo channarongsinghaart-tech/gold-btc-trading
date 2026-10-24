@@ -23,11 +23,12 @@ except Exception: pass
 
 @st.cache_resource
 def _shared_state():
-    return {'last_good':{},'notified':{},'calls':[]}
+    return {'last_good':{},'notified':{},'calls':[],'notify_time':{}}
 _S=_shared_state()
 _LAST_GOOD=_S['last_good']
 _LAST_NOTIFIED=_S['notified']
 _CALL_TIMES=_S['calls']
+_LAST_NOTIFY_TIME=_S['notify_time']  # {(symbol,mode,direction): unix_time} -- blocks re-notifying the same direction too soon, even if entry/sl shifted enough to look like a "new" signature. NOTE: like _LAST_NOTIFIED, this lives in process memory and resets if Streamlit Cloud sleeps/restarts the app -- it does not protect against a duplicate sent right after waking from sleep.
 
 def _pace_requests():
     now=time.monotonic()
@@ -242,12 +243,18 @@ def notify_line(token,message,user_id=None):
     except Exception as exc:
         return False,str(exc)
 
-def maybe_notify_entry(token,symbol,mode,r,sizing,user_id=None):
+def maybe_notify_entry(token,symbol,mode,r,sizing,user_id=None,cooldown_min=45):
     if r['status']!='ENTRY READY' or not r['plan']:return None
     p=r['plan']
     sig=(symbol,mode,r['direction'],round(p['entry'],2),round(p['sl'],2))
     key=(symbol,mode)
     if _LAST_NOTIFIED.get(key)==sig:return None
+    ckey=(symbol,mode,r['direction'])
+    last_t=_LAST_NOTIFY_TIME.get(ckey)
+    now=time.time()
+    if last_t is not None and (now-last_t)<cooldown_min*60:
+        mins_left=int((cooldown_min*60-(now-last_t))/60)+1
+        return False,f'ข้ามไว้ — เพิ่งแจ้ง {mode} {r["direction"]} ไปไม่ถึง {cooldown_min} นาที (เหลืออีก ~{mins_left} นาที)'
     lines=[f"🔔 {symbol} {mode} — ENTRY READY {r['direction']}",
            f"Entry {fmt(p['entry'])} | SL {fmt(p['sl'])}",
            f"TP1 {fmt(p['tp1'])} | TP2 {fmt(p['tp2'])} | R:R {p['rr']:.2f}R"]
@@ -255,7 +262,7 @@ def maybe_notify_entry(token,symbol,mode,r,sizing,user_id=None):
         ps=position_size(sizing['balance'],sizing['risk_pct'],p['entry'],p['sl'],sizing['contract'])
         if ps and not ps['too_small']:lines.append(f"ล็อตแนะนำ {ps['lot']:.2f} • เสี่ยง ${ps['risk_usd']:.2f}")
     ok,err=notify_line(token,'\n'.join(lines),user_id)
-    if ok:_LAST_NOTIFIED[key]=sig
+    if ok:_LAST_NOTIFIED[key]=sig;_LAST_NOTIFY_TIME[ckey]=now
     return ok,err
 
 def position_size(balance,risk_pct,entry,sl,contract,step=0.01):
@@ -297,9 +304,11 @@ with st.sidebar:
     account_balance=st.number_input('ยอดพอร์ต (USD)',min_value=0.0,value=1000.0,step=100.0) if use_sizing else 0.0
     risk_pct=st.slider('ความเสี่ยงต่อไม้ (% ของพอร์ต)',0.25,3.0,1.0,0.25,help='มืออาชีพส่วนใหญ่ใช้ราว 0.5–2% ต่อไม้ — ยิ่งต่ำ พอร์ตยิ่งทนช่วงแพ้ติดกันได้') if use_sizing else 1.0
     st.divider(); st.subheader('แจ้งเตือนเข้า LINE')
-    line_enabled=st.checkbox('เปิดแจ้งเตือนเมื่อ ENTRY READY',bool(LINE_TOKEN_DEFAULT))
+    line_enabled=st.checkbox('เปิดแจ้งเตือนเมื่อ ENTRY READY',False,help='ปิดเป็นค่าเริ่มต้น — background_scanner.py เป็นตัวแจ้งเตือนหลักอยู่แล้ว (กันซ้ำถาวรกว่า เพราะเก็บสถานะใน GitHub ไม่หายเมื่อแอปนี้ sleep/restart) เปิดตรงนี้เฉพาะถ้าต้องการแจ้งเตือนซ้อนจากแอปนี้ด้วย')
     line_token=st.text_input('LINE Channel Access Token',value=LINE_TOKEN_DEFAULT,type='password',help='ตั้งไว้ใน Streamlit Secrets แล้วจะขึ้นให้อัตโนมัติ') if line_enabled else ''
     line_user_id=st.text_input('LINE User ID',value=LINE_USER_ID_DEFAULT,help='ถ้าใส่ไว้ จะส่งแบบ push ตรงถึงคุณคนเดียว (แนะนำ) ถ้าเว้นว่างจะ broadcast ถึงทุกคนที่แอด OA นี้') if line_enabled else ''
+    notify_cooldown=st.slider('กันแจ้งเตือนซ้ำทิศเดียวกัน (นาที)',0,120,45,5) if line_enabled else 45
+    if line_enabled:st.caption('⚠️ กันซ้ำนี้อยู่ในหน่วยความจำของแอป ถ้า Streamlit Cloud พักแอปแล้วมีคนเปิดใหม่ (process รีสตาร์ท) ตัวกันซ้ำจะรีเซ็ต อาจแจ้งซ้ำได้ตอนนั้น • ถ้าไม่อยากเจอปัญหานี้เลย แนะนำปิดสวิตช์นี้แล้วใช้ background_scanner.py อย่างเดียว (กันซ้ำแบบถาวรเพราะเก็บใน GitHub)')
     if line_enabled:
         st.caption('ต้องเปิดแท็บนี้ค้างไว้พร้อม Auto refresh ถึงจะเช็คสัญญาณใหม่ได้ต่อเนื่อง • แผนฟรี LINE OA ส่งได้ราว 200 ข้อความ/เดือน')
         if st.button('ทดสอบ LINE Push'):
@@ -331,7 +340,7 @@ if have_all:
         st.warning(f"⚠️ ทั้งสองโหมดพร้อมเข้าพร้อมกัน = ทิศทางเดียวกัน ถ้าเปิดทั้งคู่ ความเสี่ยงรวมจะเป็น {2*risk_pct:g}% ของพอร์ต — เลือกโหมดเดียว หรือแบ่งความเสี่ยงคนละครึ่ง")
     if line_enabled and line_token:
         for mode_name,res in (('Short Hold',short),('Long Hold',long)):
-            out=maybe_notify_entry(line_token,symbol,mode_name,res,sizing,line_user_id or None)
+            out=maybe_notify_entry(line_token,symbol,mode_name,res,sizing,line_user_id or None,notify_cooldown)
             if out is not None:
                 ok,err=out
                 st.toast(f'ส่งแจ้งเตือน LINE ({mode_name}) แล้ว' if ok else f'ส่งแจ้งเตือน LINE ไม่สำเร็จ: {err}', icon='🔔' if ok else '⚠️')
